@@ -41,6 +41,7 @@ chronos-timeledger is a minimalist, terminal-first time tracking toolkit built w
 - Easy to archive or copy (e.g., year-based ledgers)
 - Import/copy tasks and projects between ledgers (future)
 - File format: TOML header for entities + JSONL event log for time events
+- Future goal: improve multi-device safety for shared folders (e.g., Dropbox) via atomic writes, locking, and conflict-aware merge/replay behavior
 
 ## UI Overview
 - **Running Tasks**: List of currently active tasks (parallel supported)
