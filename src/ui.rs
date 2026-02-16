@@ -8,14 +8,33 @@ use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, ExecutableCommand};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::domain::{format_duration, EventKind, Ledger, LedgerSnapshot};
 use crate::storage::save_ledger;
+
+const TERMINAL_COLORS: [&str; 16] = [
+	"black",
+	"red",
+	"green",
+	"yellow",
+	"blue",
+	"magenta",
+	"cyan",
+	"gray",
+	"dark_gray",
+	"light_red",
+	"light_green",
+	"light_yellow",
+	"light_blue",
+	"light_magenta",
+	"light_cyan",
+	"white",
+];
 
 pub fn run_dashboard(ledger: &mut Ledger, ledger_path: &Path) -> Result<(), Box<dyn Error>> {
 	enable_raw_mode()?;
@@ -53,10 +72,12 @@ fn run_event_loop(
 					continue;
 				}
 
-				let should_quit = if matches!(app.mode, InputMode::Prompt(_)) {
-					handle_prompt_key(&mut app, key.code, ledger, ledger_path)
-				} else {
-					handle_normal_key(&mut app, key.code, ledger, ledger_path, &snapshot, &view)
+				let should_quit = match &app.mode {
+					InputMode::Prompt(_) => handle_prompt_key(&mut app, key.code, ledger, ledger_path),
+					InputMode::Select(_) => handle_select_key(&mut app, key.code, ledger, ledger_path),
+					InputMode::Normal => {
+						handle_normal_key(&mut app, key.code, ledger, ledger_path, &snapshot, &view)
+					}
 				};
 
 				if should_quit {
@@ -169,15 +190,30 @@ fn draw_dashboard(
 			Line::from(format!("> {}", prompt.input)),
 			Line::from("Enter submit | Esc cancel"),
 		],
+		InputMode::Select(select) => vec![
+			Line::from(select.title.clone()),
+			Line::from(format!(
+				"Selected: {}",
+				select
+					.selected_option()
+					.map(|option| option.label.as_str())
+					.unwrap_or("(none)")
+			)),
+			Line::from("j/k or arrows move | Enter choose | Esc cancel"),
+		],
 	};
 
 	let footer = Paragraph::new(footer_lines).block(Block::default().borders(Borders::ALL).title("Input"));
 	frame.render_widget(footer, layout[3]);
+
+	if let InputMode::Select(select) = &app.mode {
+		render_select_popup(frame, select);
+	}
 }
 
 fn render_list_panel(
 	frame: &mut Frame,
-	area: ratatui::layout::Rect,
+	area: Rect,
 	title: &str,
 	focused: bool,
 	rows: &[String],
@@ -207,6 +243,60 @@ fn render_list_panel(
 		state.select(Some(selected_index.min(rows.len().saturating_sub(1))));
 	}
 	frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_select_popup(frame: &mut Frame, select: &SelectState) {
+	let area = centered_rect(62, 55, frame.area());
+	frame.render_widget(Clear, area);
+
+	let items = if select.options.is_empty() {
+		vec![ListItem::new("(no choices)")]
+	} else {
+		select
+			.options
+			.iter()
+			.map(|option| ListItem::new(option.label.clone()))
+			.collect::<Vec<_>>()
+	};
+
+	let current = if select.options.is_empty() {
+		0
+	} else {
+		select.selected.saturating_add(1)
+	};
+	let total = select.options.len();
+	let list = List::new(items)
+		.block(
+			Block::default()
+				.borders(Borders::ALL)
+				.title(format!("{} ({current}/{total})", select.title)),
+		)
+		.highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD));
+
+	let mut state = ListState::default();
+	if !select.options.is_empty() {
+		state.select(Some(select.selected.min(select.options.len().saturating_sub(1))));
+	}
+	frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+	let popup_layout = Layout::default()
+		.direction(Direction::Vertical)
+		.constraints([
+			Constraint::Percentage((100 - percent_y) / 2),
+			Constraint::Percentage(percent_y),
+			Constraint::Percentage((100 - percent_y) / 2),
+		])
+		.split(area);
+	Layout::default()
+		.direction(Direction::Horizontal)
+		.constraints([
+			Constraint::Percentage((100 - percent_x) / 2),
+			Constraint::Percentage(percent_x),
+			Constraint::Percentage((100 - percent_x) / 2),
+		])
+		.split(popup_layout[1])[1]
 }
 
 fn handle_normal_key(
@@ -244,7 +334,10 @@ fn handle_normal_key(
 			false
 		}
 		KeyCode::Char('t') => {
-			app.mode = InputMode::Prompt(PromptState::new("Task project id", PromptKind::AddTaskProject));
+			match build_task_project_select(ledger) {
+				Ok(select) => app.mode = InputMode::Select(select),
+				Err(err) => app.status = err,
+			}
 			false
 		}
 		KeyCode::Char('s') => {
@@ -324,17 +417,64 @@ fn handle_prompt_key(
 		KeyCode::Enter => {
 			let prompt = match std::mem::replace(&mut app.mode, InputMode::Normal) {
 				InputMode::Prompt(prompt) => prompt,
-				InputMode::Normal => return false,
+				InputMode::Normal | InputMode::Select(_) => return false,
 			};
 
 			match submit_prompt(prompt.clone(), ledger, ledger_path) {
-				Ok(PromptOutcome::Next(next_prompt)) => app.mode = InputMode::Prompt(next_prompt),
+				Ok(PromptOutcome::NextPrompt(next_prompt)) => app.mode = InputMode::Prompt(next_prompt),
+				Ok(PromptOutcome::Select(select)) => app.mode = InputMode::Select(select),
 				Ok(PromptOutcome::Done(message)) => {
 					app.mode = InputMode::Normal;
 					app.status = message;
 				}
 				Err(err) => {
 					app.mode = InputMode::Prompt(prompt);
+					app.status = format!("error: {err}");
+				}
+			}
+		}
+		_ => {}
+	}
+
+	false
+}
+
+fn handle_select_key(
+	app: &mut App,
+	code: KeyCode,
+	ledger: &mut Ledger,
+	ledger_path: &Path,
+) -> bool {
+	match code {
+		KeyCode::Esc => {
+			app.mode = InputMode::Normal;
+			app.status = "Selection cancelled".to_string();
+		}
+		KeyCode::Up | KeyCode::Char('k') => {
+			if let InputMode::Select(select) = &mut app.mode {
+				select.move_selection(-1);
+			}
+		}
+		KeyCode::Down | KeyCode::Char('j') => {
+			if let InputMode::Select(select) = &mut app.mode {
+				select.move_selection(1);
+			}
+		}
+		KeyCode::Enter => {
+			let select = match std::mem::replace(&mut app.mode, InputMode::Normal) {
+				InputMode::Select(select) => select,
+				_ => return false,
+			};
+
+			match submit_select(select.clone(), ledger, ledger_path) {
+				Ok(SelectOutcome::NextPrompt(prompt)) => app.mode = InputMode::Prompt(prompt),
+				Ok(SelectOutcome::NextSelect(next_select)) => app.mode = InputMode::Select(next_select),
+				Ok(SelectOutcome::Done(message)) => {
+					app.mode = InputMode::Normal;
+					app.status = message;
+				}
+				Err(err) => {
+					app.mode = InputMode::Select(select);
 					app.status = format!("error: {err}");
 				}
 			}
@@ -353,20 +493,11 @@ fn submit_prompt(
 	match prompt.kind {
 		PromptKind::AddProjectName => {
 			let name = required_text(&prompt.input, "project name")?;
-			Ok(PromptOutcome::Next(PromptState::new(
-				"Project color (optional)",
-				PromptKind::AddProjectColor { name },
-			)))
-		}
-		PromptKind::AddProjectColor { name } => {
-			let color = optional_text(&prompt.input);
-			let project_id = ledger.add_project(name, color);
-			persist(ledger_path, ledger)?;
-			Ok(PromptOutcome::Done(format!("created project {project_id}")))
+			Ok(PromptOutcome::Select(build_project_color_select(name)))
 		}
 		PromptKind::AddCategoryName => {
 			let name = required_text(&prompt.input, "category name")?;
-			Ok(PromptOutcome::Next(PromptState::new(
+			Ok(PromptOutcome::NextPrompt(PromptState::new(
 				"Category description (optional)",
 				PromptKind::AddCategoryDescription { name },
 			)))
@@ -376,31 +507,6 @@ fn submit_prompt(
 			let category_id = ledger.add_category(name, description);
 			persist(ledger_path, ledger)?;
 			Ok(PromptOutcome::Done(format!("created category {category_id}")))
-		}
-		PromptKind::AddTaskProject => {
-			let project_id = required_text(&prompt.input, "project id")?;
-			if ledger.project(&project_id).is_none() {
-				return Err(format!("project not found: {project_id}"));
-			}
-			Ok(PromptOutcome::Next(PromptState::new(
-				"Task category id (optional)",
-				PromptKind::AddTaskCategory { project_id },
-			)))
-		}
-		PromptKind::AddTaskCategory { project_id } => {
-			let category_id = optional_text(&prompt.input);
-			if let Some(category_id) = &category_id {
-				if ledger.category(category_id).is_none() {
-					return Err(format!("category not found: {category_id}"));
-				}
-			}
-			Ok(PromptOutcome::Next(PromptState::new(
-				"Task description",
-				PromptKind::AddTaskDescription {
-					project_id,
-					category_id,
-				},
-			)))
 		}
 		PromptKind::AddTaskDescription {
 			project_id,
@@ -421,14 +527,14 @@ fn submit_prompt(
 		}
 		PromptKind::ManualLogStart { task_id } => {
 			let start = parse_datetime(required_text(&prompt.input, "start timestamp")?.as_str())?;
-			Ok(PromptOutcome::Next(PromptState::new(
+			Ok(PromptOutcome::NextPrompt(PromptState::new(
 				"Manual log stop (RFC3339)",
 				PromptKind::ManualLogStop { task_id, start },
 			)))
 		}
 		PromptKind::ManualLogStop { task_id, start } => {
 			let stop = parse_datetime(required_text(&prompt.input, "stop timestamp")?.as_str())?;
-			Ok(PromptOutcome::Next(PromptState::new(
+			Ok(PromptOutcome::NextPrompt(PromptState::new(
 				"Manual log note (optional)",
 				PromptKind::ManualLogNote {
 					task_id,
@@ -448,6 +554,100 @@ fn submit_prompt(
 			Ok(PromptOutcome::Done(format!("recorded manual session for {task_id}")))
 		}
 	}
+}
+
+fn submit_select(
+	select: SelectState,
+	ledger: &mut Ledger,
+	ledger_path: &Path,
+) -> Result<SelectOutcome, String> {
+	let selected_value = select
+		.selected_option()
+		.map(|option| option.value.clone())
+		.ok_or_else(|| "no option selected".to_string())?;
+
+	match select.kind {
+		SelectKind::ProjectColor { name } => {
+			let project_id = ledger.add_project(name, selected_value);
+			persist(ledger_path, ledger)?;
+			Ok(SelectOutcome::Done(format!("created project {project_id}")))
+		}
+		SelectKind::TaskProject => {
+			let project_id = selected_value.ok_or_else(|| "selected project is missing".to_string())?;
+			Ok(SelectOutcome::NextSelect(build_task_category_select(ledger, project_id)))
+		}
+		SelectKind::TaskCategory { project_id } => Ok(SelectOutcome::NextPrompt(PromptState::new(
+			"Task description",
+			PromptKind::AddTaskDescription {
+				project_id,
+				category_id: selected_value,
+			},
+		))),
+	}
+}
+
+fn build_project_color_select(name: String) -> SelectState {
+	let mut options = vec![SelectOption::new("No color", None)];
+	for color in TERMINAL_COLORS {
+		options.push(SelectOption::new(color, Some(color.to_string())));
+	}
+
+	SelectState::new("Select project color", SelectKind::ProjectColor { name }, options)
+}
+
+fn build_task_project_select(ledger: &Ledger) -> Result<SelectState, String> {
+	let mut projects = ledger
+		.header
+		.projects
+		.iter()
+		.filter(|project| !project.archived)
+		.collect::<Vec<_>>();
+	projects.sort_by(|left, right| left.name.cmp(&right.name).then_with(|| left.id.cmp(&right.id)));
+
+	if projects.is_empty() {
+		return Err("no active projects found. Press 'p' to create one first".to_string());
+	}
+
+	let options = projects
+		.into_iter()
+		.map(|project| {
+			let color = project
+				.color
+				.as_ref()
+				.map(|color| format!(" | color={color}"))
+				.unwrap_or_default();
+			SelectOption::new(
+				format!("{} | {}{}", project.id, project.name, color),
+				Some(project.id.clone()),
+			)
+		})
+		.collect::<Vec<_>>();
+
+	Ok(SelectState::new("Select project", SelectKind::TaskProject, options))
+}
+
+fn build_task_category_select(ledger: &Ledger, project_id: String) -> SelectState {
+	let mut categories = ledger
+		.header
+		.categories
+		.iter()
+		.filter(|category| !category.archived)
+		.collect::<Vec<_>>();
+	categories.sort_by(|left, right| left.name.cmp(&right.name).then_with(|| left.id.cmp(&right.id)));
+
+	let mut options = vec![SelectOption::new("Uncategorized", None)];
+	for category in categories {
+		options.push(SelectOption::new(
+			format!("{} | {}", category.id, category.name),
+			Some(category.id.clone()),
+		));
+	}
+
+	SelectState::new(
+		"Select category",
+		SelectKind::TaskCategory { project_id },
+		options,
+	)
 }
 
 fn build_view(ledger: &Ledger, snapshot: &LedgerSnapshot, now: DateTime<Utc>) -> ViewModel {
@@ -615,7 +815,15 @@ fn parse_datetime(input: &str) -> Result<DateTime<Utc>, String> {
 
 #[derive(Debug, Clone)]
 enum PromptOutcome {
-	Next(PromptState),
+	NextPrompt(PromptState),
+	Select(SelectState),
+	Done(String),
+}
+
+#[derive(Debug, Clone)]
+enum SelectOutcome {
+	NextPrompt(PromptState),
+	NextSelect(SelectState),
 	Done(String),
 }
 
@@ -637,18 +845,62 @@ impl PromptState {
 }
 
 #[derive(Debug, Clone)]
+struct SelectState {
+	title: String,
+	options: Vec<SelectOption>,
+	selected: usize,
+	kind: SelectKind,
+}
+
+impl SelectState {
+	fn new(title: impl Into<String>, kind: SelectKind, options: Vec<SelectOption>) -> Self {
+		Self {
+			title: title.into(),
+			options,
+			selected: 0,
+			kind,
+		}
+	}
+
+	fn move_selection(&mut self, delta: i32) {
+		if self.options.is_empty() {
+			self.selected = 0;
+			return;
+		}
+
+		if delta > 0 {
+			self.selected = (self.selected + delta as usize).min(self.options.len() - 1);
+		} else {
+			self.selected = self.selected.saturating_sub(delta.unsigned_abs() as usize);
+		}
+	}
+
+	fn selected_option(&self) -> Option<&SelectOption> {
+		self.options.get(self.selected)
+	}
+}
+
+#[derive(Debug, Clone)]
+struct SelectOption {
+	label: String,
+	value: Option<String>,
+}
+
+impl SelectOption {
+	fn new(label: impl Into<String>, value: Option<String>) -> Self {
+		Self {
+			label: label.into(),
+			value,
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
 enum PromptKind {
 	AddProjectName,
-	AddProjectColor {
-		name: String,
-	},
 	AddCategoryName,
 	AddCategoryDescription {
 		name: String,
-	},
-	AddTaskProject,
-	AddTaskCategory {
-		project_id: String,
 	},
 	AddTaskDescription {
 		project_id: String,
@@ -671,6 +923,17 @@ enum PromptKind {
 		task_id: String,
 		start: DateTime<Utc>,
 		stop: DateTime<Utc>,
+	},
+}
+
+#[derive(Debug, Clone)]
+enum SelectKind {
+	ProjectColor {
+		name: String,
+	},
+	TaskProject,
+	TaskCategory {
+		project_id: String,
 	},
 }
 
@@ -703,6 +966,7 @@ impl FocusPane {
 enum InputMode {
 	Normal,
 	Prompt(PromptState),
+	Select(SelectState),
 }
 
 #[derive(Debug, Clone)]
