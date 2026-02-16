@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
@@ -15,7 +15,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 
 use crate::domain::{format_duration, EventKind, Ledger, LedgerSnapshot};
-use crate::storage::save_ledger;
+use crate::ledgers::{recent_ledgers, remember_ledger};
+use crate::storage::{load_ledger, save_ledger};
 
 const TERMINAL_COLORS: [&str; 16] = [
 	"black",
@@ -39,7 +40,7 @@ const FOCUSED_PANEL_BORDER_COLOR: Color = Color::Yellow;
 const INACTIVE_PANEL_BORDER_COLOR: Color = Color::DarkGray;
 const HIGHLIGHT_BACKGROUND_COLOR: Color = Color::Rgb(42, 45, 52);
 
-pub fn run_dashboard(ledger: &mut Ledger, ledger_path: &Path) -> Result<(), Box<dyn Error>> {
+pub fn run_dashboard(ledger: &mut Ledger, ledger_path: &mut PathBuf) -> Result<(), Box<dyn Error>> {
 	enable_raw_mode()?;
 	let mut stdout = io::stdout();
 	stdout.execute(EnterAlternateScreen)?;
@@ -58,7 +59,7 @@ pub fn run_dashboard(ledger: &mut Ledger, ledger_path: &Path) -> Result<(), Box<
 fn run_event_loop(
 	terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 	ledger: &mut Ledger,
-	ledger_path: &Path,
+	ledger_path: &mut PathBuf,
 ) -> Result<(), Box<dyn Error>> {
 	let mut app = App::default();
 
@@ -67,7 +68,7 @@ fn run_event_loop(
 		let snapshot = ledger.snapshot(now);
 		let view = build_view(ledger, &snapshot, now);
 		app.clamp_selection(&view);
-		terminal.draw(|frame| draw_dashboard(frame, &app, ledger, &snapshot, &view, now))?;
+		terminal.draw(|frame| draw_dashboard(frame, &app, ledger, ledger_path.as_path(), &snapshot, &view, now))?;
 
 		if event::poll(StdDuration::from_millis(250))? {
 			if let CEvent::Key(key) = event::read()? {
@@ -97,6 +98,7 @@ fn draw_dashboard(
 	frame: &mut Frame,
 	app: &App,
 	ledger: &Ledger,
+	ledger_path: &Path,
 	snapshot: &LedgerSnapshot,
 	view: &ViewModel,
 	now: DateTime<Utc>,
@@ -112,8 +114,9 @@ fn draw_dashboard(
 		.split(frame.area());
 
 	let header = Paragraph::new(format!(
-		"chronos-timeledger | {} | projects={} tasks={} active={} tracked={}",
+		"chronos-timeledger | {} | ledger={} | projects={} tasks={} active={} tracked={}",
 		now.format("%Y-%m-%d %H:%M:%S UTC"),
+		ledger_path.display(),
 		ledger.header.projects.len(),
 		ledger.header.tasks.len(),
 		snapshot.active_tasks.len(),
@@ -185,7 +188,7 @@ fn draw_dashboard(
 	let footer_lines = match &app.mode {
 		InputMode::Normal => vec![
 			Line::from("Tab focus | j/k or arrows move | Enter start/stop | q quit"),
-			Line::from("p project | c category | t task | s start(note) | x stop(note) | l manual log"),
+			Line::from("p project | c category | t task | s start(note) | x stop(note) | l manual log | o switch ledger"),
 			Line::from(app.status.clone()),
 		],
 		InputMode::Prompt(prompt) => vec![
@@ -315,7 +318,7 @@ fn handle_normal_key(
 	app: &mut App,
 	code: KeyCode,
 	ledger: &mut Ledger,
-	ledger_path: &Path,
+	ledger_path: &mut PathBuf,
 	snapshot: &LedgerSnapshot,
 	view: &ViewModel,
 ) -> bool {
@@ -385,12 +388,19 @@ fn handle_normal_key(
 			}
 			false
 		}
+		KeyCode::Char('o') => {
+			match build_ledger_switch_select(ledger_path.as_path()) {
+				Ok(select) => app.mode = InputMode::Select(select),
+				Err(err) => app.status = err,
+			}
+			false
+		}
 		KeyCode::Enter => {
 			if let Some(task_id) = app.selected_task_id(view) {
 				let result = if snapshot.active_tasks.contains_key(&task_id) {
-					stop_task(ledger, ledger_path, &task_id, None)
+					stop_task(ledger, ledger_path.as_path(), &task_id, None)
 				} else {
-					start_task(ledger, ledger_path, &task_id, None)
+					start_task(ledger, ledger_path.as_path(), &task_id, None)
 				};
 				app.status = match result {
 					Ok(message) => message,
@@ -409,7 +419,7 @@ fn handle_prompt_key(
 	app: &mut App,
 	code: KeyCode,
 	ledger: &mut Ledger,
-	ledger_path: &Path,
+	ledger_path: &mut PathBuf,
 ) -> bool {
 	match code {
 		KeyCode::Esc => {
@@ -432,7 +442,7 @@ fn handle_prompt_key(
 				InputMode::Normal | InputMode::Select(_) => return false,
 			};
 
-			match submit_prompt(prompt.clone(), ledger, ledger_path) {
+			match submit_prompt(prompt.clone(), ledger, ledger_path.as_path()) {
 				Ok(PromptOutcome::NextPrompt(next_prompt)) => app.mode = InputMode::Prompt(next_prompt),
 				Ok(PromptOutcome::Select(select)) => app.mode = InputMode::Select(select),
 				Ok(PromptOutcome::Done(message)) => {
@@ -455,7 +465,7 @@ fn handle_select_key(
 	app: &mut App,
 	code: KeyCode,
 	ledger: &mut Ledger,
-	ledger_path: &Path,
+	ledger_path: &mut PathBuf,
 ) -> bool {
 	match code {
 		KeyCode::Esc => {
@@ -574,7 +584,7 @@ fn submit_prompt(
 fn submit_select(
 	select: SelectState,
 	ledger: &mut Ledger,
-	ledger_path: &Path,
+	ledger_path: &mut PathBuf,
 ) -> Result<SelectOutcome, String> {
 	let selected_value = select
 		.selected_option()
@@ -585,7 +595,7 @@ fn submit_select(
 		SelectKind::ProjectColor { name } => {
 			let created_name = name.clone();
 			ledger.add_project(name, selected_value);
-			persist(ledger_path, ledger)?;
+			persist(ledger_path.as_path(), ledger)?;
 			Ok(SelectOutcome::Done(format!("created project: {created_name}")))
 		}
 		SelectKind::TaskProject => {
@@ -599,6 +609,12 @@ fn submit_select(
 				category_id: selected_value,
 			},
 		))),
+		SelectKind::LedgerSwitch => {
+			let selected_path = selected_value
+				.map(PathBuf::from)
+				.ok_or_else(|| "selected ledger path is missing".to_string())?;
+			switch_ledger(ledger, ledger_path, selected_path).map(SelectOutcome::Done)
+		}
 	}
 }
 
@@ -670,6 +686,53 @@ fn build_task_category_select(ledger: &Ledger, project_id: String) -> SelectStat
 		SelectKind::TaskCategory { project_id },
 		options,
 	)
+}
+
+fn build_ledger_switch_select(current_path: &Path) -> Result<SelectState, String> {
+	let mut paths = recent_ledgers(100).map_err(|err| format!("failed to load recent ledgers: {err}"))?;
+	let current_path = current_path.to_path_buf();
+	if !paths.iter().any(|path| path == &current_path) {
+		paths.insert(0, current_path.clone());
+	}
+
+	if paths.is_empty() {
+		return Err("no known ledgers. run once with --ledger <path> first".to_string());
+	}
+
+	let current_value = current_path.display().to_string();
+	let options = paths
+		.into_iter()
+		.map(|path| {
+			let value = path.display().to_string();
+			let is_current = value == current_value;
+			let exists = path.exists();
+			let mut label = value.clone();
+			if is_current {
+				label = format!("* {label}");
+			}
+			if !exists {
+				label = format!("[missing] {label}");
+			}
+
+			let style = if is_current {
+				Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+			} else if exists {
+				Style::default()
+			} else {
+				Style::default().fg(Color::DarkGray)
+			};
+
+			SelectOption::new(label, Some(value), style)
+		})
+		.collect::<Vec<_>>();
+
+	let mut select = SelectState::new("Switch ledger", SelectKind::LedgerSwitch, options);
+	select.selected = select
+		.options
+		.iter()
+		.position(|option| option.value.as_deref() == Some(current_value.as_str()))
+		.unwrap_or(0);
+	Ok(select)
 }
 
 fn build_view(ledger: &Ledger, snapshot: &LedgerSnapshot, now: DateTime<Utc>) -> ViewModel {
@@ -834,6 +897,28 @@ fn stop_task(
 	ledger.stop_task(task_id, Utc::now(), note)?;
 	persist(ledger_path, ledger)?;
 	Ok(format!("stopped: {task}"))
+}
+
+fn switch_ledger(ledger: &mut Ledger, ledger_path: &mut PathBuf, next_path: PathBuf) -> Result<String, String> {
+	if &next_path == ledger_path {
+		return Ok(format!("already using ledger: {}", ledger_path.display()));
+	}
+
+	if !next_path.exists() {
+		return Err(format!("ledger does not exist: {}", next_path.display()));
+	}
+
+	let next_ledger = load_ledger(&next_path).map_err(|err| err.to_string())?;
+	*ledger = next_ledger;
+	*ledger_path = next_path;
+
+	match remember_ledger(ledger_path.as_path()) {
+		Ok(()) => Ok(format!("switched ledger: {}", ledger_path.display())),
+		Err(err) => Ok(format!(
+			"switched ledger: {} (warning: failed to store recents: {err})",
+			ledger_path.display()
+		)),
+	}
 }
 
 fn persist(path: &Path, ledger: &Ledger) -> Result<(), String> {
@@ -1050,6 +1135,7 @@ enum SelectKind {
 	TaskCategory {
 		project_id: String,
 	},
+	LedgerSwitch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
