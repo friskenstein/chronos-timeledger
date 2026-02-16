@@ -35,10 +35,9 @@ const TERMINAL_COLORS: [&str; 16] = [
 	"light_cyan",
 	"white",
 ];
-const FOCUSED_PANEL_BORDER_COLOR: Color = Color::Cyan;
+const FOCUSED_PANEL_BORDER_COLOR: Color = Color::Yellow;
 const INACTIVE_PANEL_BORDER_COLOR: Color = Color::DarkGray;
-const HIGHLIGHT_TEXT_COLOR: Color = Color::Gray;
-const HIGHLIGHT_BACKGROUND_COLOR: Color = Color::Black;
+const HIGHLIGHT_BACKGROUND_COLOR: Color = Color::Rgb(42, 45, 52);
 
 pub fn run_dashboard(ledger: &mut Ledger, ledger_path: &Path) -> Result<(), Box<dyn Error>> {
 	enable_raw_mode()?;
@@ -121,7 +120,7 @@ fn draw_dashboard(
 		format_duration(snapshot.total_tracked()),
 	))
 	.block(Block::default().borders(Borders::ALL).title("Dashboard"))
-	.style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+	.style(Style::default().fg(Color::DarkGray));
 	frame.render_widget(header, layout[0]);
 
 	let middle = Layout::default()
@@ -245,11 +244,7 @@ fn render_list_panel(
 
 	let list = List::new(items)
 		.block(block)
-		.highlight_style(
-			Style::default()
-				.fg(HIGHLIGHT_TEXT_COLOR)
-				.bg(HIGHLIGHT_BACKGROUND_COLOR),
-		);
+		.highlight_style(Style::default().bg(HIGHLIGHT_BACKGROUND_COLOR).add_modifier(Modifier::BOLD));
 
 	let mut state = ListState::default();
 	if !rows.is_empty() {
@@ -287,7 +282,6 @@ fn render_select_popup(frame: &mut Frame, select: &SelectState) {
 		.highlight_symbol(">> ")
 		.highlight_style(
 			Style::default()
-				.fg(HIGHLIGHT_TEXT_COLOR)
 				.bg(HIGHLIGHT_BACKGROUND_COLOR),
 		);
 
