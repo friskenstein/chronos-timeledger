@@ -330,6 +330,12 @@ pub struct LedgerSnapshot {
 }
 
 impl LedgerSnapshot {
+	pub fn total_tracked(&self) -> Duration {
+		self.task_totals
+			.values()
+			.fold(Duration::zero(), |acc, value| acc + *value)
+	}
+
 	pub fn total_for_day(&self, day: NaiveDate, task_id: &str) -> Duration {
 		self.daily_task_totals
 			.get(&day)

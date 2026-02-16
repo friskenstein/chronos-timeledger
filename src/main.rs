@@ -96,7 +96,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 			println!("initialized ledger at {}", cli.ledger.display());
 		}
 		Command::Dashboard => {
-			run_dashboard(&ledger)?;
+			run_dashboard(&mut ledger, &cli.ledger)?;
 		}
 		Command::AddProject { name, color } => {
 			let project_id = ledger.add_project(name, color);
