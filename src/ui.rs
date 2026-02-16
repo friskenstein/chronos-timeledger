@@ -10,7 +10,7 @@ use crossterm::{execute, ExecutableCommand};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 
@@ -162,7 +162,7 @@ fn draw_dashboard(
 	let day_lines = if view.day_rows.is_empty() {
 		vec![Line::from("No tracked sessions today")]
 	} else {
-		view.day_rows.iter().map(|line| Line::from(line.clone())).collect()
+		view.day_rows.clone()
 	};
 	let day = Paragraph::new(day_lines)
 		.block(Block::default().borders(Borders::ALL).title("Day Summary"));
@@ -216,13 +216,16 @@ fn render_list_panel(
 	area: Rect,
 	title: &str,
 	focused: bool,
-	rows: &[String],
+	rows: &[DisplayRow],
 	selected_index: usize,
 ) {
 	let items = if rows.is_empty() {
 		vec![ListItem::new("(empty)")]
 	} else {
-		rows.iter().map(|row| ListItem::new(row.clone())).collect::<Vec<_>>()
+		rows
+			.iter()
+			.map(|row| ListItem::new(row.line.clone()))
+			.collect::<Vec<_>>()
 	};
 
 	let block = Block::default()
@@ -236,7 +239,7 @@ fn render_list_panel(
 
 	let list = List::new(items)
 		.block(block)
-		.highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD));
+		.highlight_style(Style::default().bg(Color::Black));
 
 	let mut state = ListState::default();
 	if !rows.is_empty() {
@@ -255,7 +258,7 @@ fn render_select_popup(frame: &mut Frame, select: &SelectState) {
 		select
 			.options
 			.iter()
-			.map(|option| ListItem::new(option.label.clone()))
+			.map(|option| ListItem::new(option.label.clone()).style(option.style))
 			.collect::<Vec<_>>()
 	};
 
@@ -271,7 +274,8 @@ fn render_select_popup(frame: &mut Frame, select: &SelectState) {
 				.borders(Borders::ALL)
 				.title(format!("{} ({current}/{total})", select.title)),
 		)
-		.highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD));
+		.highlight_symbol(">> ")
+		.highlight_style(Style::default().bg(Color::Black));
 
 	let mut state = ListState::default();
 	if !select.options.is_empty() {
@@ -504,18 +508,20 @@ fn submit_prompt(
 		}
 		PromptKind::AddCategoryDescription { name } => {
 			let description = optional_text(&prompt.input);
-			let category_id = ledger.add_category(name, description);
+			let created_name = name.clone();
+			ledger.add_category(name, description);
 			persist(ledger_path, ledger)?;
-			Ok(PromptOutcome::Done(format!("created category {category_id}")))
+			Ok(PromptOutcome::Done(format!("created category: {created_name}")))
 		}
 		PromptKind::AddTaskDescription {
 			project_id,
 			category_id,
 		} => {
 			let description = required_text(&prompt.input, "task description")?;
-			let task_id = ledger.add_task(project_id, category_id, description)?;
+			let task_label = description.lines().next().unwrap_or("(no description)").to_string();
+			ledger.add_task(project_id, category_id, description)?;
 			persist(ledger_path, ledger)?;
-			Ok(PromptOutcome::Done(format!("created task {task_id}")))
+			Ok(PromptOutcome::Done(format!("created task: {task_label}")))
 		}
 		PromptKind::StartTaskNote { task_id } => {
 			let note = optional_text(&prompt.input);
@@ -549,9 +555,10 @@ fn submit_prompt(
 			stop,
 		} => {
 			let note = optional_text(&prompt.input);
+			let task_label = task_label(ledger, &task_id);
 			ledger.add_manual_session(&task_id, start, stop, note)?;
 			persist(ledger_path, ledger)?;
-			Ok(PromptOutcome::Done(format!("recorded manual session for {task_id}")))
+			Ok(PromptOutcome::Done(format!("recorded manual session for: {task_label}")))
 		}
 	}
 }
@@ -568,9 +575,10 @@ fn submit_select(
 
 	match select.kind {
 		SelectKind::ProjectColor { name } => {
-			let project_id = ledger.add_project(name, selected_value);
+			let created_name = name.clone();
+			ledger.add_project(name, selected_value);
 			persist(ledger_path, ledger)?;
-			Ok(SelectOutcome::Done(format!("created project {project_id}")))
+			Ok(SelectOutcome::Done(format!("created project: {created_name}")))
 		}
 		SelectKind::TaskProject => {
 			let project_id = selected_value.ok_or_else(|| "selected project is missing".to_string())?;
@@ -587,9 +595,18 @@ fn submit_select(
 }
 
 fn build_project_color_select(name: String) -> SelectState {
-	let mut options = vec![SelectOption::new("No color", None)];
+	let mut options = vec![SelectOption::new(
+		"No color",
+		None,
+		Style::default().fg(Color::Gray),
+	)];
 	for color in TERMINAL_COLORS {
-		options.push(SelectOption::new(color, Some(color.to_string())));
+		let swatch = "████████████████".to_string();
+		options.push(SelectOption::new(
+			swatch,
+			Some(color.to_string()),
+			color_block_style(color),
+		));
 	}
 
 	SelectState::new("Select project color", SelectKind::ProjectColor { name }, options)
@@ -611,14 +628,10 @@ fn build_task_project_select(ledger: &Ledger) -> Result<SelectState, String> {
 	let options = projects
 		.into_iter()
 		.map(|project| {
-			let color = project
-				.color
-				.as_ref()
-				.map(|color| format!(" | color={color}"))
-				.unwrap_or_default();
 			SelectOption::new(
-				format!("{} | {}{}", project.id, project.name, color),
+				project.name.clone(),
 				Some(project.id.clone()),
+				style_from_project_color(project.color.as_deref()),
 			)
 		})
 		.collect::<Vec<_>>();
@@ -635,11 +648,12 @@ fn build_task_category_select(ledger: &Ledger, project_id: String) -> SelectStat
 		.collect::<Vec<_>>();
 	categories.sort_by(|left, right| left.name.cmp(&right.name).then_with(|| left.id.cmp(&right.id)));
 
-	let mut options = vec![SelectOption::new("Uncategorized", None)];
+	let mut options = vec![SelectOption::new("Uncategorized", None, Style::default())];
 	for category in categories {
 		options.push(SelectOption::new(
-			format!("{} | {}", category.id, category.name),
+			category.name.clone(),
 			Some(category.id.clone()),
+			Style::default(),
 		));
 	}
 
@@ -664,9 +678,18 @@ fn build_view(ledger: &Ledger, snapshot: &LedgerSnapshot, now: DateTime<Utc>) ->
 		let title = task
 			.map(|task| task.short_description())
 			.unwrap_or_else(|| "Unknown task".to_string());
+		let project_name = task
+			.and_then(|task| ledger.project(&task.project_id))
+			.map(|project| project.name.clone())
+			.unwrap_or_else(|| "Unknown project".to_string());
+		let project_style = task_style_for_id(ledger, &task_id);
 		let elapsed = format_duration(now - started_at);
 		let note = note.map(|note| format!(" note={note}")).unwrap_or_default();
-		running_rows.push(format!("{elapsed} | {task_id} | {title}{note}"));
+		running_rows.push(DisplayRow::new(Line::from(vec![
+			Span::raw(format!("{elapsed} | ")),
+			Span::styled(project_name, project_style),
+			Span::raw(format!(" | {title}{note}")),
+		])));
 		running_ids.push(task_id);
 	}
 
@@ -677,8 +700,16 @@ fn build_view(ledger: &Ledger, snapshot: &LedgerSnapshot, now: DateTime<Utc>) ->
 		let title = task
 			.map(|task| task.short_description())
 			.unwrap_or_else(|| "Unknown task".to_string());
+		let project_name = task
+			.and_then(|task| ledger.project(&task.project_id))
+			.map(|project| project.name.clone())
+			.unwrap_or_else(|| "Unknown project".to_string());
+		let project_style = task_style_for_id(ledger, task_id);
 		let today_total = format_duration(snapshot.total_for_day(now.date_naive(), task_id));
-		recent_rows.push(format!("{task_id} | {title} | today {today_total}"));
+		recent_rows.push(DisplayRow::new(Line::from(vec![
+			Span::styled(project_name, project_style),
+			Span::raw(format!(" | {title} | today {today_total}")),
+		])));
 		recent_ids.push(task_id.clone());
 	}
 
@@ -701,27 +732,33 @@ fn build_view(ledger: &Ledger, snapshot: &LedgerSnapshot, now: DateTime<Utc>) ->
 			.project(&task.project_id)
 			.map(|project| project.name.clone())
 			.unwrap_or_else(|| "Unknown project".to_string());
+		let project_style = style_from_project_color(
+			ledger
+				.project(&task.project_id)
+				.and_then(|project| project.color.as_deref()),
+		);
 		let running = if snapshot.active_tasks.contains_key(&task.id) {
 			"RUN"
 		} else {
 			"   "
 		};
-		task_rows.push(format!(
-			"{running} | {} | {} | {}",
-			task.id,
-			project_name,
-			task.short_description()
-		));
+		task_rows.push(DisplayRow::new(Line::from(vec![
+			Span::raw(format!("{running} | ")),
+			Span::styled(project_name, project_style),
+			Span::raw(format!(" | {}", task.short_description())),
+		])));
 		task_ids.push(task.id.clone());
 	}
 
 	let mut day_rows = Vec::new();
 	for (task_id, duration) in snapshot.totals_for_day(now.date_naive()).into_iter().take(8) {
-		let title = ledger
-			.task(&task_id)
-			.map(|task| task.short_description())
-			.unwrap_or_else(|| "Unknown task".to_string());
-		day_rows.push(format!("{} | {} | {}", format_duration(duration), task_id, title));
+		let (project_name, title) = task_project_and_title(ledger, &task_id);
+		let project_style = task_style_for_id(ledger, &task_id);
+		day_rows.push(Line::from(vec![
+			Span::raw(format!("{} | ", format_duration(duration))),
+			Span::styled(project_name, project_style),
+			Span::raw(format!(" | {title}")),
+		]));
 	}
 
 	let event_rows = ledger
@@ -730,24 +767,28 @@ fn build_view(ledger: &Ledger, snapshot: &LedgerSnapshot, now: DateTime<Utc>) ->
 		.rev()
 		.take(12)
 		.map(|event| match &event.kind {
-			EventKind::Start { task_id, note } => format!(
+			EventKind::Start { task_id, note } => {
+				let (_, title) = task_project_and_title(ledger, task_id);
+				format!(
 				"{} start {}{}",
 				event.timestamp.format("%H:%M:%S"),
-				task_id,
+				title,
 				note
 					.as_ref()
 					.map(|value| format!(" note={value}"))
 					.unwrap_or_default()
-			),
-			EventKind::Stop { task_id, note } => format!(
+			)}
+			EventKind::Stop { task_id, note } => {
+				let (_, title) = task_project_and_title(ledger, task_id);
+				format!(
 				"{} stop {}{}",
 				event.timestamp.format("%H:%M:%S"),
-				task_id,
+				title,
 				note
 					.as_ref()
 					.map(|value| format!(" note={value}"))
 					.unwrap_or_default()
-			),
+			)}
 		})
 		.collect::<Vec<_>>();
 
@@ -769,9 +810,10 @@ fn start_task(
 	task_id: &str,
 	note: Option<String>,
 ) -> Result<String, String> {
+	let task = task_label(ledger, task_id);
 	ledger.start_task(task_id, Utc::now(), note)?;
 	persist(ledger_path, ledger)?;
-	Ok(format!("started {task_id}"))
+	Ok(format!("started: {task}"))
 }
 
 fn stop_task(
@@ -780,9 +822,10 @@ fn stop_task(
 	task_id: &str,
 	note: Option<String>,
 ) -> Result<String, String> {
+	let task = task_label(ledger, task_id);
 	ledger.stop_task(task_id, Utc::now(), note)?;
 	persist(ledger_path, ledger)?;
-	Ok(format!("stopped {task_id}"))
+	Ok(format!("stopped: {task}"))
 }
 
 fn persist(path: &Path, ledger: &Ledger) -> Result<(), String> {
@@ -811,6 +854,68 @@ fn parse_datetime(input: &str) -> Result<DateTime<Utc>, String> {
 	DateTime::parse_from_rfc3339(input)
 		.map(|datetime| datetime.with_timezone(&Utc))
 		.map_err(|_| "invalid datetime, expected RFC3339".to_string())
+}
+
+fn task_label(ledger: &Ledger, task_id: &str) -> String {
+	ledger
+		.task(task_id)
+		.map(|task| task.short_description())
+		.unwrap_or_else(|| "Unknown task".to_string())
+}
+
+fn task_project_and_title(ledger: &Ledger, task_id: &str) -> (String, String) {
+	if let Some(task) = ledger.task(task_id) {
+		let project = ledger
+			.project(&task.project_id)
+			.map(|project| project.name.clone())
+			.unwrap_or_else(|| "Unknown project".to_string());
+		return (project, task.short_description());
+	}
+
+	("Unknown project".to_string(), "Unknown task".to_string())
+}
+
+fn task_style_for_id(ledger: &Ledger, task_id: &str) -> Style {
+	let color_name = ledger
+		.task(task_id)
+		.and_then(|task| ledger.project(&task.project_id))
+		.and_then(|project| project.color.as_deref());
+	style_from_project_color(color_name)
+}
+
+fn style_from_project_color(color_name: Option<&str>) -> Style {
+	color_name
+		.and_then(color_from_name)
+		.map(|color| Style::default().fg(color))
+		.unwrap_or_default()
+}
+
+fn color_block_style(color_name: &str) -> Style {
+	color_from_name(color_name)
+		.map(|color| Style::default().fg(color))
+		.unwrap_or_default()
+}
+
+fn color_from_name(color_name: &str) -> Option<Color> {
+	match color_name {
+		"black" => Some(Color::Black),
+		"red" => Some(Color::Red),
+		"green" => Some(Color::Green),
+		"yellow" => Some(Color::Yellow),
+		"blue" => Some(Color::Blue),
+		"magenta" => Some(Color::Magenta),
+		"cyan" => Some(Color::Cyan),
+		"gray" => Some(Color::Gray),
+		"dark_gray" => Some(Color::DarkGray),
+		"light_red" => Some(Color::LightRed),
+		"light_green" => Some(Color::LightGreen),
+		"light_yellow" => Some(Color::LightYellow),
+		"light_blue" => Some(Color::LightBlue),
+		"light_magenta" => Some(Color::LightMagenta),
+		"light_cyan" => Some(Color::LightCyan),
+		"white" => Some(Color::White),
+		_ => None,
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -884,13 +989,15 @@ impl SelectState {
 struct SelectOption {
 	label: String,
 	value: Option<String>,
+	style: Style,
 }
 
 impl SelectOption {
-	fn new(label: impl Into<String>, value: Option<String>) -> Self {
+	fn new(label: impl Into<String>, value: Option<String>, style: Style) -> Self {
 		Self {
 			label: label.into(),
 			value,
+			style,
 		}
 	}
 }
@@ -1055,14 +1162,24 @@ impl App {
 }
 
 struct ViewModel {
-	running_rows: Vec<String>,
+	running_rows: Vec<DisplayRow>,
 	running_ids: Vec<String>,
-	recent_rows: Vec<String>,
+	recent_rows: Vec<DisplayRow>,
 	recent_ids: Vec<String>,
-	task_rows: Vec<String>,
+	task_rows: Vec<DisplayRow>,
 	task_ids: Vec<String>,
-	day_rows: Vec<String>,
+	day_rows: Vec<Line<'static>>,
 	event_rows: Vec<String>,
+}
+
+struct DisplayRow {
+	line: Line<'static>,
+}
+
+impl DisplayRow {
+	fn new(line: Line<'static>) -> Self {
+		Self { line }
+	}
 }
 
 pub fn print_event_log(ledger: &Ledger, limit: usize) {
@@ -1071,7 +1188,7 @@ pub fn print_event_log(ledger: &Ledger, limit: usize) {
 			EventKind::Start { task_id, note } => format!(
 				"{} start {}{}",
 				event.timestamp.to_rfc3339(),
-				task_id,
+				task_label(ledger, task_id),
 				note
 					.as_ref()
 					.map(|value| format!(" note={value}"))
@@ -1080,7 +1197,7 @@ pub fn print_event_log(ledger: &Ledger, limit: usize) {
 			EventKind::Stop { task_id, note } => format!(
 				"{} stop {}{}",
 				event.timestamp.to_rfc3339(),
-				task_id,
+				task_label(ledger, task_id),
 				note
 					.as_ref()
 					.map(|value| format!(" note={value}"))
