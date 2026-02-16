@@ -35,6 +35,10 @@ const TERMINAL_COLORS: [&str; 16] = [
 	"light_cyan",
 	"white",
 ];
+const FOCUSED_PANEL_BORDER_COLOR: Color = Color::Cyan;
+const INACTIVE_PANEL_BORDER_COLOR: Color = Color::DarkGray;
+const HIGHLIGHT_TEXT_COLOR: Color = Color::Gray;
+const HIGHLIGHT_BACKGROUND_COLOR: Color = Color::Black;
 
 pub fn run_dashboard(ledger: &mut Ledger, ledger_path: &Path) -> Result<(), Box<dyn Error>> {
 	enable_raw_mode()?;
@@ -232,14 +236,20 @@ fn render_list_panel(
 		.borders(Borders::ALL)
 		.title(title)
 		.border_style(if focused {
-			Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-		} else {
 			Style::default()
+				.fg(FOCUSED_PANEL_BORDER_COLOR)
+				.add_modifier(Modifier::BOLD)
+		} else {
+			Style::default().fg(INACTIVE_PANEL_BORDER_COLOR)
 		});
 
 	let list = List::new(items)
 		.block(block)
-		.highlight_style(Style::default().bg(Color::Black));
+		.highlight_style(
+			Style::default()
+				.fg(HIGHLIGHT_TEXT_COLOR)
+				.bg(HIGHLIGHT_BACKGROUND_COLOR),
+		);
 
 	let mut state = ListState::default();
 	if !rows.is_empty() {
@@ -275,7 +285,11 @@ fn render_select_popup(frame: &mut Frame, select: &SelectState) {
 				.title(format!("{} ({current}/{total})", select.title)),
 		)
 		.highlight_symbol(">> ")
-		.highlight_style(Style::default().bg(Color::Black));
+		.highlight_style(
+			Style::default()
+				.fg(HIGHLIGHT_TEXT_COLOR)
+				.bg(HIGHLIGHT_BACKGROUND_COLOR),
+		);
 
 	let mut state = ListState::default();
 	if !select.options.is_empty() {
