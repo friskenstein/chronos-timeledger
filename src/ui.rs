@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, TimeZone, Utc};
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, ExecutableCommand};
@@ -69,7 +69,7 @@ fn run_event_loop(
 		let snapshot = ledger.snapshot(now);
 		let view = build_view(&app, ledger, &snapshot, now);
 		app.clamp_selection(&view);
-		terminal.draw(|frame| draw_dashboard(frame, &app, &snapshot, &view))?;
+		terminal.draw(|frame| draw_dashboard(frame, &app, &view))?;
 
 		if event::poll(StdDuration::from_millis(250))? {
 			if let CEvent::Key(key) = event::read()? {
@@ -95,7 +95,7 @@ fn run_event_loop(
 	Ok(())
 }
 
-fn draw_dashboard(frame: &mut Frame, app: &App, snapshot: &LedgerSnapshot, view: &ViewModel) {
+fn draw_dashboard(frame: &mut Frame, app: &App, view: &ViewModel) {
 	let layout = Layout::default()
 		.direction(Direction::Vertical)
 		.constraints([Constraint::Min(12), Constraint::Length(4)])
@@ -115,7 +115,7 @@ fn draw_dashboard(frame: &mut Frame, app: &App, snapshot: &LedgerSnapshot, view:
 		.constraints([Constraint::Length(11), Constraint::Min(8)])
 		.split(body[0]);
 
-	render_calendar_panel(frame, left[0], app, snapshot);
+	render_calendar_panel(frame, left[0], app, &view.calendar_active_days);
 	render_explorer_panel(frame, left[1], app, view);
 	render_selected_day_panel(frame, body[1], app, view);
 	render_week_stats_panel(frame, body[2], view);
@@ -126,7 +126,12 @@ fn draw_dashboard(frame: &mut Frame, app: &App, snapshot: &LedgerSnapshot, view:
 	}
 }
 
-fn render_calendar_panel(frame: &mut Frame, area: Rect, app: &App, snapshot: &LedgerSnapshot) {
+fn render_calendar_panel(
+	frame: &mut Frame,
+	area: Rect,
+	app: &App,
+	active_days: &HashSet<NaiveDate>,
+) {
 	let month = app.calendar_month;
 	let selected_day = app.selected_day;
 	let mut lines = Vec::new();
@@ -135,12 +140,6 @@ fn render_calendar_panel(frame: &mut Frame, area: Rect, app: &App, snapshot: &Le
 
 	let first_weekday = month.weekday().number_from_monday() as usize - 1;
 	let days_in_month = days_in_month(month.year(), month.month());
-	let active_days = snapshot
-		.daily_task_totals
-		.keys()
-		.copied()
-		.collect::<HashSet<_>>();
-
 	let mut day_counter = 1u32;
 	for week in 0..6 {
 		let mut spans = Vec::new();
@@ -301,7 +300,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 				"Tab pane | arrows/hjkl navigate | Enter open/collapse (explorer) | q quit",
 			),
 			Line::from(
-				"space start/stop (day+explorer) | o new task in project | p project | c category | t task | s/x start/stop note | g switch ledger",
+				"space start/stop (day+explorer) | d delete interval(day) | o new task | p project | c category | t task | s/x start/stop note | g switch ledger",
 			),
 			Line::from(format!(
 				"{}{}",
@@ -337,8 +336,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_day_row_line(row: &DaySessionRow, selected_field: DayField, is_selected: bool) -> Line<'static> {
 	let lane_text = lane_text(row.lane, row.lane_count);
-	let start_text = row.display_start.format("%H:%M").to_string();
-	let end_text = row.display_stop.format("%H:%M").to_string();
+	let start_text = row.display_start.with_timezone(&Local).format("%H:%M").to_string();
+	let end_text = row.display_stop.with_timezone(&Local).format("%H:%M").to_string();
 
 	let start_style = if is_selected && selected_field == DayField::Start {
 		Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -582,6 +581,27 @@ fn handle_normal_key(
 			}
 			false
 		}
+		KeyCode::Char('d') => {
+			if app.focus != FocusPane::Day {
+				app.status = "Focus the Day view to delete an interval".to_string();
+				return false;
+			}
+
+			let Some(row) = view.day_rows.get(app.day_index) else {
+				app.status = "No selected interval to delete".to_string();
+				return false;
+			};
+			let Some(start_event_index) = row.start_event_index else {
+				app.status = "Selected interval cannot be deleted".to_string();
+				return false;
+			};
+
+			app.mode = InputMode::Select(build_delete_interval_select(
+				row,
+				start_event_index,
+			));
+			false
+		}
 		KeyCode::Char(' ') => {
 			if let Some(task_id) = app.selected_task_id(view) {
 				let result = if snapshot.active_tasks.contains_key(&task_id) {
@@ -663,14 +683,16 @@ fn handle_day_digit_input(app: &mut App, digit: char, ledger: &mut Ledger, ledge
 	};
 
 	let base_date = match app.day_field {
-		DayField::Start => row.start.date_naive(),
-		DayField::End => row.stop.date_naive(),
+		DayField::Start => row.start.with_timezone(&Local).date_naive(),
+		DayField::End => row.stop.with_timezone(&Local).date_naive(),
 	};
-	let Some(naive) = base_date.and_hms_opt(hour, minute, 0) else {
-		app.status = "invalid clock time".to_string();
-		return;
+	let next_timestamp = match local_clock_on_date_to_utc(base_date, hour, minute) {
+		Ok(timestamp) => timestamp,
+		Err(err) => {
+			app.status = err;
+			return;
+		}
 	};
-	let next_timestamp = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
 
 	match app.day_field {
 		DayField::Start => {
@@ -681,6 +703,12 @@ fn handle_day_digit_input(app: &mut App, digit: char, ledger: &mut Ledger, ledge
 			if next_timestamp >= row.stop {
 				app.status = "start must be before end".to_string();
 				return;
+			}
+			if let Some(previous_stop) = previous_stop_for_task(ledger, &row.task_id, event_index) {
+				if next_timestamp < previous_stop {
+					app.status = "start cannot be before previous stop for this task".to_string();
+					return;
+				}
 			}
 
 			if !matches!(ledger.events.get(event_index).map(|event| &event.kind), Some(EventKind::Start { .. })) {
@@ -693,7 +721,10 @@ fn handle_day_digit_input(app: &mut App, digit: char, ledger: &mut Ledger, ledge
 				app.status = format!("error: {err}");
 				return;
 			}
-			app.status = format!("updated start to {}", next_timestamp.format("%H:%M"));
+			app.status = format!(
+				"updated start to {}",
+				next_timestamp.with_timezone(&Local).format("%H:%M")
+			);
 		}
 		DayField::End => {
 			let Some(event_index) = row.stop_event_index else {
@@ -703,6 +734,16 @@ fn handle_day_digit_input(app: &mut App, digit: char, ledger: &mut Ledger, ledge
 			if next_timestamp <= row.start {
 				app.status = "end must be after start".to_string();
 				return;
+			}
+			if next_timestamp > Utc::now() {
+				app.status = "end cannot be later than current time".to_string();
+				return;
+			}
+			if let Some(next_start) = next_start_for_task(ledger, &row.task_id, event_index) {
+				if next_timestamp > next_start {
+					app.status = "end cannot be after following start for this task".to_string();
+					return;
+				}
 			}
 
 			if !matches!(ledger.events.get(event_index).map(|event| &event.kind), Some(EventKind::Stop { .. })) {
@@ -715,9 +756,70 @@ fn handle_day_digit_input(app: &mut App, digit: char, ledger: &mut Ledger, ledge
 				app.status = format!("error: {err}");
 				return;
 			}
-			app.status = format!("updated end to {}", next_timestamp.format("%H:%M"));
+			app.status = format!(
+				"updated end to {}",
+				next_timestamp.with_timezone(&Local).format("%H:%M")
+			);
 		}
 	}
+}
+
+fn previous_stop_for_task(ledger: &Ledger, task_id: &str, start_event_index: usize) -> Option<DateTime<Utc>> {
+	let task_events = sorted_task_events(ledger, task_id);
+	let current_position = task_events
+		.iter()
+		.position(|entry| entry.index == start_event_index && entry.kind == TaskEventKind::Start)?;
+	task_events[..current_position]
+		.iter()
+		.rev()
+		.find(|entry| entry.kind == TaskEventKind::Stop)
+		.map(|entry| entry.timestamp)
+}
+
+fn next_start_for_task(ledger: &Ledger, task_id: &str, stop_event_index: usize) -> Option<DateTime<Utc>> {
+	let task_events = sorted_task_events(ledger, task_id);
+	let current_position = task_events
+		.iter()
+		.position(|entry| entry.index == stop_event_index && entry.kind == TaskEventKind::Stop)?;
+	task_events
+		.iter()
+		.skip(current_position + 1)
+		.find(|entry| entry.kind == TaskEventKind::Start)
+		.map(|entry| entry.timestamp)
+}
+
+fn sorted_task_events(ledger: &Ledger, task_id: &str) -> Vec<TaskEventRef> {
+	let mut events = ledger
+		.events
+		.iter()
+		.enumerate()
+		.filter_map(|(index, event)| match &event.kind {
+			EventKind::Start {
+				task_id: event_task_id,
+				..
+			} if event_task_id == task_id => Some(TaskEventRef {
+				index,
+				timestamp: event.timestamp,
+				kind: TaskEventKind::Start,
+			}),
+			EventKind::Stop {
+				task_id: event_task_id,
+				..
+			} if event_task_id == task_id => Some(TaskEventRef {
+				index,
+				timestamp: event.timestamp,
+				kind: TaskEventKind::Stop,
+			}),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	events.sort_by(|left, right| {
+		left
+			.timestamp
+			.cmp(&right.timestamp)
+			.then_with(|| left.index.cmp(&right.index))
+	});
+	events
 }
 
 fn handle_prompt_key(
@@ -891,6 +993,27 @@ fn submit_select(
 				.ok_or_else(|| "selected ledger path is missing".to_string())?;
 			switch_ledger(ledger, ledger_path, selected_path).map(SelectOutcome::Done)
 		}
+		SelectKind::DeleteIntervalConfirm {
+			start_event_index,
+			stop_event_index,
+			task_title,
+		} => {
+			let action = selected_value
+				.as_deref()
+				.ok_or_else(|| "selected action is missing".to_string())?;
+			if action == "delete" {
+				delete_interval(
+					ledger,
+					ledger_path.as_path(),
+					start_event_index,
+					stop_event_index,
+					task_title.as_str(),
+				)
+				.map(SelectOutcome::Done)
+			} else {
+				Ok(SelectOutcome::Done("Delete cancelled".to_string()))
+			}
+		}
 	}
 }
 
@@ -1011,13 +1134,46 @@ fn build_ledger_switch_select(current_path: &Path) -> Result<SelectState, String
 	Ok(select)
 }
 
+fn build_delete_interval_select(row: &DaySessionRow, start_event_index: usize) -> SelectState {
+	let title = format!(
+		"Delete interval? {} {}-{}",
+		row.task_title,
+		row.display_start.with_timezone(&Local).format("%H:%M"),
+		row.display_stop.with_timezone(&Local).format("%H:%M")
+	);
+	let options = vec![
+		SelectOption::new(
+			"Delete",
+			Some("delete".to_string()),
+			Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+		),
+		SelectOption::new("Cancel", Some("cancel".to_string()), Style::default()),
+	];
+
+	let mut select = SelectState::new(
+		title,
+		SelectKind::DeleteIntervalConfirm {
+			start_event_index,
+			stop_event_index: row.stop_event_index,
+			task_title: row.task_title.clone(),
+		},
+		options,
+	);
+	// Default to cancel to prevent accidental deletions.
+	select.selected = 1;
+	select
+}
+
 fn build_view(app: &App, ledger: &Ledger, snapshot: &LedgerSnapshot, now: DateTime<Utc>) -> ViewModel {
 	let sessions = collect_sessions(ledger, now);
-	let (day_rows, day_total) = build_day_rows(app.selected_day, ledger, sessions);
-	let week_stats = build_week_stats(app.selected_day, ledger, snapshot);
+	let daily_task_totals = build_local_daily_task_totals(&sessions);
+	let calendar_active_days = daily_task_totals.keys().copied().collect::<HashSet<_>>();
+	let (day_rows, day_total) = build_day_rows(app.selected_day, ledger, &sessions);
+	let week_stats = build_week_stats(app.selected_day, ledger, &daily_task_totals);
 	let explorer_rows = build_explorer_rows(app, ledger, snapshot, &week_stats);
 
 	ViewModel {
+		calendar_active_days,
 		day_rows,
 		day_total,
 		week_stats,
@@ -1086,12 +1242,11 @@ fn collect_sessions(ledger: &Ledger, now: DateTime<Utc>) -> Vec<SessionRecord> {
 	sessions
 }
 
-fn build_day_rows(selected_day: NaiveDate, ledger: &Ledger, sessions: Vec<SessionRecord>) -> (Vec<DaySessionRow>, Duration) {
-	let day_start = day_start(selected_day);
-	let day_end = day_start + Duration::days(1);
+fn build_day_rows(selected_day: NaiveDate, ledger: &Ledger, sessions: &[SessionRecord]) -> (Vec<DaySessionRow>, Duration) {
+	let (day_start, day_end) = local_day_bounds_utc(selected_day);
 
 	let mut rows = sessions
-		.into_iter()
+		.iter()
 		.filter_map(|session| {
 			if session.stop <= day_start || session.start >= day_end {
 				return None;
@@ -1111,11 +1266,11 @@ fn build_day_rows(selected_day: NaiveDate, ledger: &Ledger, sessions: Vec<Sessio
 			let project_style = task_style_for_id(ledger, &session.task_id);
 
 			Some(DaySessionRow {
-				task_id: session.task_id,
+				task_id: session.task_id.clone(),
 				project_name,
 				task_title,
 				project_style,
-				note: session.note,
+				note: session.note.clone(),
 				start: session.start,
 				stop: session.stop,
 				display_start,
@@ -1159,7 +1314,49 @@ fn build_day_rows(selected_day: NaiveDate, ledger: &Ledger, sessions: Vec<Sessio
 	(rows, day_total)
 }
 
-fn build_week_stats(selected_day: NaiveDate, ledger: &Ledger, snapshot: &LedgerSnapshot) -> WeekStatsView {
+fn build_local_daily_task_totals(sessions: &[SessionRecord]) -> BTreeMap<NaiveDate, HashMap<String, Duration>> {
+	let mut daily_task_totals = BTreeMap::<NaiveDate, HashMap<String, Duration>>::new();
+
+	for session in sessions {
+		if session.stop <= session.start {
+			continue;
+		}
+
+		let mut day = session.start.with_timezone(&Local).date_naive();
+		let last_moment = session.stop - Duration::seconds(1);
+		let last_day = last_moment.with_timezone(&Local).date_naive();
+		while day <= last_day {
+			let (day_start, day_end) = local_day_bounds_utc(day);
+			let slice_start = if session.start > day_start {
+				session.start
+			} else {
+				day_start
+			};
+			let slice_end = if session.stop < day_end {
+				session.stop
+			} else {
+				day_end
+			};
+
+			if slice_end > slice_start {
+				let task_totals = daily_task_totals.entry(day).or_default();
+				*task_totals
+					.entry(session.task_id.clone())
+					.or_insert_with(Duration::zero) += slice_end - slice_start;
+			}
+
+			day = day.succ_opt().expect("next day should exist");
+		}
+	}
+
+	daily_task_totals
+}
+
+fn build_week_stats(
+	selected_day: NaiveDate,
+	ledger: &Ledger,
+	daily_task_totals: &BTreeMap<NaiveDate, HashMap<String, Duration>>,
+) -> WeekStatsView {
 	let week_start = start_of_week(selected_day);
 	let mut daily = Vec::new();
 	let mut total = Duration::zero();
@@ -1169,8 +1366,7 @@ fn build_week_stats(selected_day: NaiveDate, ledger: &Ledger, snapshot: &LedgerS
 
 	for offset in 0..7 {
 		let day = week_start + Duration::days(offset);
-		let durations = snapshot
-			.daily_task_totals
+		let durations = daily_task_totals
 			.get(&day)
 			.cloned()
 			.unwrap_or_default();
@@ -1385,6 +1581,50 @@ fn stop_task(
 	Ok(format!("stopped: {task}"))
 }
 
+fn delete_interval(
+	ledger: &mut Ledger,
+	ledger_path: &Path,
+	start_event_index: usize,
+	stop_event_index: Option<usize>,
+	task_title: &str,
+) -> Result<String, String> {
+	if start_event_index >= ledger.events.len() {
+		return Err("interval start event no longer exists".to_string());
+	}
+	if !matches!(
+		ledger.events.get(start_event_index).map(|event| &event.kind),
+		Some(EventKind::Start { .. })
+	) {
+		return Err("interval start event mismatch".to_string());
+	}
+
+	if let Some(stop_index) = stop_event_index {
+		if stop_index >= ledger.events.len() {
+			return Err("interval stop event no longer exists".to_string());
+		}
+		if !matches!(
+			ledger.events.get(stop_index).map(|event| &event.kind),
+			Some(EventKind::Stop { .. })
+		) {
+			return Err("interval stop event mismatch".to_string());
+		}
+	}
+
+	let mut indices = vec![start_event_index];
+	if let Some(stop_index) = stop_event_index {
+		if stop_index != start_event_index {
+			indices.push(stop_index);
+		}
+	}
+	indices.sort_unstable_by(|left, right| right.cmp(left));
+	for index in indices {
+		ledger.events.remove(index);
+	}
+
+	persist(ledger_path, ledger)?;
+	Ok(format!("deleted interval: {task_title}"))
+}
+
 fn switch_ledger(ledger: &mut Ledger, ledger_path: &mut PathBuf, next_path: PathBuf) -> Result<String, String> {
 	if &next_path == ledger_path {
 		return Ok(format!("already using ledger: {}", ledger_path.display()));
@@ -1519,11 +1759,28 @@ fn start_of_week(day: NaiveDate) -> NaiveDate {
 	day - Duration::days(days_from_monday)
 }
 
-fn day_start(day: NaiveDate) -> DateTime<Utc> {
-	DateTime::<Utc>::from_naive_utc_and_offset(
-		day.and_hms_opt(0, 0, 0).expect("midnight must be valid"),
-		Utc,
-	)
+fn local_naive_to_utc(naive: chrono::NaiveDateTime) -> Option<DateTime<Utc>> {
+	match Local.from_local_datetime(&naive) {
+		LocalResult::Single(local_datetime) => Some(local_datetime.with_timezone(&Utc)),
+		LocalResult::Ambiguous(first, second) => Some(first.min(second).with_timezone(&Utc)),
+		LocalResult::None => None,
+	}
+}
+
+fn local_day_bounds_utc(day: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
+	let start_naive = day.and_hms_opt(0, 0, 0).expect("midnight must be valid");
+	let next_day = day.succ_opt().expect("next day should exist");
+	let end_naive = next_day.and_hms_opt(0, 0, 0).expect("midnight must be valid");
+	let start = local_naive_to_utc(start_naive).expect("local day start should be valid");
+	let end = local_naive_to_utc(end_naive).expect("local day end should be valid");
+	(start, end)
+}
+
+fn local_clock_on_date_to_utc(day: NaiveDate, hour: u32, minute: u32) -> Result<DateTime<Utc>, String> {
+	let naive = day
+		.and_hms_opt(hour, minute, 0)
+		.ok_or_else(|| "invalid clock time".to_string())?;
+	local_naive_to_utc(naive).ok_or_else(|| "selected local time does not exist".to_string())
 }
 
 fn shift_month(day: NaiveDate, delta: i32) -> NaiveDate {
@@ -1663,6 +1920,11 @@ enum SelectKind {
 		project_id: String,
 	},
 	LedgerSwitch,
+	DeleteIntervalConfirm {
+		start_event_index: usize,
+		stop_event_index: Option<usize>,
+		task_title: String,
+	},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1729,7 +1991,7 @@ struct App {
 
 impl Default for App {
 	fn default() -> Self {
-		let today = Utc::now().date_naive();
+		let today = Local::now().date_naive();
 		Self {
 			focus: FocusPane::Explorer,
 			selected_day: today,
@@ -1863,6 +2125,7 @@ impl App {
 }
 
 struct ViewModel {
+	calendar_active_days: HashSet<NaiveDate>,
 	day_rows: Vec<DaySessionRow>,
 	day_total: Duration,
 	week_stats: WeekStatsView,
@@ -1949,6 +2212,18 @@ struct SessionRecord {
 	note: Option<String>,
 	start_event_index: Option<usize>,
 	stop_event_index: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskEventKind {
+	Start,
+	Stop,
+}
+
+struct TaskEventRef {
+	index: usize,
+	timestamp: DateTime<Utc>,
+	kind: TaskEventKind,
 }
 
 pub fn print_event_log(ledger: &Ledger, limit: usize) {
