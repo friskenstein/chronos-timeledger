@@ -298,10 +298,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 	let footer_lines = match &app.mode {
 		InputMode::Normal => vec![
 			Line::from(
-				"Tab pane | arrows/hjkl navigate | Enter toggle task | q quit",
+				"Tab pane | arrows/hjkl navigate | Enter open/collapse (explorer) | q quit",
 			),
 			Line::from(
-				"space start/stop(explorer) | o new task in project | p project | c category | t task | s/x start/stop note | g switch ledger",
+				"space start/stop (day+explorer) | o new task in project | p project | c category | t task | s/x start/stop note | g switch ledger",
 			),
 			Line::from(format!(
 				"{}{}",
@@ -583,18 +583,20 @@ fn handle_normal_key(
 			false
 		}
 		KeyCode::Char(' ') => {
-			if app.focus == FocusPane::Explorer {
-				if let Some(task_id) = app.selected_task_id(view) {
-					let result = if snapshot.active_tasks.contains_key(&task_id) {
-						stop_task(ledger, ledger_path.as_path(), &task_id, None)
-					} else {
-						start_task(ledger, ledger_path.as_path(), &task_id, None)
-					};
-					app.status = match result {
-						Ok(message) => message,
-						Err(err) => format!("error: {err}"),
-					};
-				}
+			if let Some(task_id) = app.selected_task_id(view) {
+				let result = if snapshot.active_tasks.contains_key(&task_id) {
+					stop_task(ledger, ledger_path.as_path(), &task_id, None)
+				} else {
+					start_task(ledger, ledger_path.as_path(), &task_id, None)
+				};
+				app.status = match result {
+					Ok(message) => message,
+					Err(err) => format!("error: {err}"),
+				};
+			} else if app.focus == FocusPane::Day {
+				app.status = "No task selected in day view".to_string();
+			} else if app.focus == FocusPane::Explorer {
+				app.status = "Select a task row in Explorer first".to_string();
 			}
 			false
 		}
@@ -618,34 +620,12 @@ fn handle_normal_key(
 							app.explorer_collapsed_categories.insert(key);
 						}
 					}
-					Some(ExplorerRowKind::Task { task_id, .. }) => {
-						let result = if snapshot.active_tasks.contains_key(&task_id) {
-							stop_task(ledger, ledger_path.as_path(), &task_id, None)
-						} else {
-							start_task(ledger, ledger_path.as_path(), &task_id, None)
-						};
-						app.status = match result {
-							Ok(message) => message,
-							Err(err) => format!("error: {err}"),
-						};
+					Some(ExplorerRowKind::Task { .. }) => {
+						app.status = "Press space to start/stop this task".to_string();
 					}
 					Some(ExplorerRowKind::Empty) | None => {}
 				}
 				return false;
-			}
-
-			if let Some(task_id) = app.selected_task_id(view) {
-				let result = if snapshot.active_tasks.contains_key(&task_id) {
-					stop_task(ledger, ledger_path.as_path(), &task_id, None)
-				} else {
-					start_task(ledger, ledger_path.as_path(), &task_id, None)
-				};
-				app.status = match result {
-					Ok(message) => message,
-					Err(err) => format!("error: {err}"),
-				};
-			} else {
-				app.status = "Select a task first".to_string();
 			}
 			false
 		}
