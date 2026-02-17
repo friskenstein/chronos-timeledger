@@ -1,9 +1,10 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, ExecutableCommand};
@@ -14,7 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use crate::domain::{format_duration, EventKind, Ledger, LedgerSnapshot};
+use crate::domain::{format_duration, EventKind, Ledger, LedgerSnapshot, Task, TimeEvent};
 use crate::ledgers::{recent_ledgers, remember_ledger};
 use crate::storage::{load_ledger, save_ledger};
 
@@ -66,9 +67,9 @@ fn run_event_loop(
 	loop {
 		let now = Utc::now();
 		let snapshot = ledger.snapshot(now);
-		let view = build_view(ledger, &snapshot, now);
+		let view = build_view(&app, ledger, &snapshot, now);
 		app.clamp_selection(&view);
-		terminal.draw(|frame| draw_dashboard(frame, &app, ledger, ledger_path.as_path(), &snapshot, &view, now))?;
+		terminal.draw(|frame| draw_dashboard(frame, &app, &snapshot, &view))?;
 
 		if event::poll(StdDuration::from_millis(250))? {
 			if let CEvent::Key(key) = event::read()? {
@@ -94,102 +95,223 @@ fn run_event_loop(
 	Ok(())
 }
 
-fn draw_dashboard(
-	frame: &mut Frame,
-	app: &App,
-	ledger: &Ledger,
-	ledger_path: &Path,
-	snapshot: &LedgerSnapshot,
-	view: &ViewModel,
-	now: DateTime<Utc>,
-) {
+fn draw_dashboard(frame: &mut Frame, app: &App, snapshot: &LedgerSnapshot, view: &ViewModel) {
 	let layout = Layout::default()
 		.direction(Direction::Vertical)
-		.constraints([
-			Constraint::Length(3),
-			Constraint::Min(12),
-			Constraint::Length(8),
-			Constraint::Length(4),
-		])
+		.constraints([Constraint::Min(12), Constraint::Length(4)])
 		.split(frame.area());
 
-	let header = Paragraph::new(format!(
-		"chronos-timeledger | {} | ledger={} | projects={} tasks={} active={} tracked={}",
-		now.format("%Y-%m-%d %H:%M:%S UTC"),
-		ledger_path.display(),
-		ledger.header.projects.len(),
-		ledger.header.tasks.len(),
-		snapshot.active_tasks.len(),
-		format_duration(snapshot.total_tracked()),
-	))
-	.block(Block::default().borders(Borders::ALL).title("Dashboard"))
-	.style(Style::default().fg(Color::DarkGray));
-	frame.render_widget(header, layout[0]);
-
-	let middle = Layout::default()
+	let body = Layout::default()
 		.direction(Direction::Horizontal)
 		.constraints([
-			Constraint::Percentage(34),
-			Constraint::Percentage(33),
-			Constraint::Percentage(33),
+			Constraint::Percentage(28),
+			Constraint::Percentage(44),
+			Constraint::Percentage(28),
 		])
-		.split(layout[1]);
+		.split(layout[0]);
 
-	render_list_panel(
-		frame,
-		middle[0],
-		"Running",
-		app.focus == FocusPane::Running,
-		&view.running_rows,
-		app.running_index,
-	);
-	render_list_panel(
-		frame,
-		middle[1],
-		"Recent",
-		app.focus == FocusPane::Recent,
-		&view.recent_rows,
-		app.recent_index,
-	);
-	render_list_panel(
-		frame,
-		middle[2],
-		"Tasks",
-		app.focus == FocusPane::Tasks,
-		&view.task_rows,
-		app.task_index,
-	);
+	let left = Layout::default()
+		.direction(Direction::Vertical)
+		.constraints([Constraint::Length(11), Constraint::Min(8)])
+		.split(body[0]);
 
-	let lower = Layout::default()
-		.direction(Direction::Horizontal)
-		.constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-		.split(layout[2]);
+	render_calendar_panel(frame, left[0], app, snapshot);
+	render_explorer_panel(frame, left[1], app, view);
+	render_selected_day_panel(frame, body[1], app, view);
+	render_week_stats_panel(frame, body[2], view);
+	render_footer(frame, layout[1], app);
 
-	let day_lines = if view.day_rows.is_empty() {
-		vec![Line::from("No tracked sessions today")]
-	} else {
-		view.day_rows.clone()
+	if let InputMode::Select(select) = &app.mode {
+		render_select_popup(frame, select);
+	}
+}
+
+fn render_calendar_panel(frame: &mut Frame, area: Rect, app: &App, snapshot: &LedgerSnapshot) {
+	let month = app.calendar_month;
+	let selected_day = app.selected_day;
+	let mut lines = Vec::new();
+	lines.push(Line::from(format!("{} {}", month.format("%B"), month.year())));
+	lines.push(Line::from("Mo Tu We Th Fr Sa Su"));
+
+	let first_weekday = month.weekday().number_from_monday() as usize - 1;
+	let days_in_month = days_in_month(month.year(), month.month());
+	let active_days = snapshot
+		.daily_task_totals
+		.keys()
+		.copied()
+		.collect::<HashSet<_>>();
+
+	let mut day_counter = 1u32;
+	for week in 0..6 {
+		let mut spans = Vec::new();
+		for weekday_index in 0..7 {
+			let before_first = week == 0 && weekday_index < first_weekday;
+			let after_last = day_counter > days_in_month;
+			if before_first || after_last {
+				spans.push(Span::raw("   "));
+				continue;
+			}
+
+			let date = NaiveDate::from_ymd_opt(month.year(), month.month(), day_counter)
+				.expect("calendar day must be valid");
+			let mut style = Style::default();
+			if date == selected_day {
+				style = style.fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
+			} else if active_days.contains(&date) {
+				style = style.fg(Color::LightYellow).add_modifier(Modifier::BOLD);
+			}
+
+			spans.push(Span::styled(format!("{:>2} ", day_counter), style));
+			day_counter += 1;
+		}
+		lines.push(Line::from(spans));
+	}
+
+	let block = Block::default()
+		.borders(Borders::ALL)
+		.title("Calendar")
+		.border_style(border_style(app.focus == FocusPane::Calendar));
+	let calendar = Paragraph::new(lines).block(block);
+	frame.render_widget(calendar, area);
+}
+
+fn render_explorer_panel(frame: &mut Frame, area: Rect, app: &App, view: &ViewModel) {
+	let title = match &app.explorer_mode {
+		ExplorerMode::Projects => "Explorer: Projects".to_string(),
+		ExplorerMode::ProjectTasks { project_name, .. } => format!("Explorer: {project_name}"),
 	};
-	let day = Paragraph::new(day_lines)
-		.block(Block::default().borders(Borders::ALL).title("Day Summary"));
-	frame.render_widget(day, lower[0]);
 
-	let event_items = if view.event_rows.is_empty() {
-		vec![ListItem::new("No events yet")]
+	let items = view
+		.explorer_rows
+		.iter()
+		.map(|row| ListItem::new(row.line.clone()))
+		.collect::<Vec<_>>();
+
+	let mut state = ListState::default();
+	if !view.explorer_rows.is_empty() {
+		state.select(Some(app.explorer_index.min(view.explorer_rows.len() - 1)));
+	}
+
+	let block = Block::default()
+		.borders(Borders::ALL)
+		.title(title)
+		.border_style(border_style(app.focus == FocusPane::Explorer));
+	let list = List::new(if items.is_empty() {
+		vec![ListItem::new("(empty)")]
 	} else {
-		view.event_rows
-			.iter()
-			.map(|line| ListItem::new(line.clone()))
-			.collect::<Vec<_>>()
-	};
-	let events = List::new(event_items).block(Block::default().borders(Borders::ALL).title("Recent Events"));
-	frame.render_widget(events, lower[1]);
+		items
+	})
+	.block(block)
+	.highlight_style(Style::default().bg(HIGHLIGHT_BACKGROUND_COLOR).add_modifier(Modifier::BOLD));
 
+	frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_selected_day_panel(frame: &mut Frame, area: Rect, app: &App, view: &ViewModel) {
+	let mut items = Vec::new();
+	for (index, row) in view.day_rows.iter().enumerate() {
+		items.push(ListItem::new(render_day_row_line(
+			row,
+			app.day_field,
+			index == app.day_index,
+		)));
+	}
+
+	if items.is_empty() {
+		items.push(ListItem::new("(no sessions for selected day)"));
+	}
+
+	let mut state = ListState::default();
+	if !view.day_rows.is_empty() {
+		state.select(Some(app.day_index.min(view.day_rows.len() - 1)));
+	}
+
+	let title = format!(
+		"{} | total {}",
+		app.selected_day.format("%A, %d %B %Y"),
+		format_duration(view.day_total)
+	);
+	let list = List::new(items)
+		.block(
+			Block::default()
+				.borders(Borders::ALL)
+				.title(title)
+				.border_style(border_style(app.focus == FocusPane::Day)),
+		)
+		.highlight_style(Style::default().bg(HIGHLIGHT_BACKGROUND_COLOR).add_modifier(Modifier::BOLD));
+
+	frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_week_stats_panel(frame: &mut Frame, area: Rect, view: &ViewModel) {
+	let week = &view.week_stats;
+	let mut lines = Vec::new();
+	lines.push(Line::from(format!(
+		"Week {} - {}",
+		week.week_start.format("%d %b"),
+		(week.week_start + Duration::days(6)).format("%d %b")
+	)));
+	lines.push(Line::from(format!("Total: {}", format_duration(week.total))));
+	lines.push(Line::from(format!("Avg/day: {}", format_duration(week.avg_per_day))));
+	lines.push(Line::from(format!("Max/day: {}", format_duration(week.max_day))));
+	lines.push(Line::from(format!("Active days: {}", week.active_days)));
+	lines.push(Line::from(""));
+	lines.push(Line::from("Daily Activity"));
+
+	let max_seconds = week
+		.daily
+		.iter()
+		.map(|(_, duration)| duration.num_seconds())
+		.max()
+		.unwrap_or(0)
+		.max(1);
+	for (day, duration) in &week.daily {
+		let seconds = duration.num_seconds();
+		let width = ((seconds as f64 / max_seconds as f64) * 16.0).round() as usize;
+		let bar = "=".repeat(width.max(1));
+		lines.push(Line::from(format!(
+			"{} {:>8} {}",
+			day.format("%a"),
+			format_duration(*duration),
+			if seconds == 0 { "".to_string() } else { bar }
+		)));
+	}
+
+	lines.push(Line::from(""));
+	lines.push(Line::from("Top Projects"));
+	if week.top_projects.is_empty() {
+		lines.push(Line::from("(none)"));
+	} else {
+		for project in week.top_projects.iter().take(6) {
+			lines.push(Line::from(vec![
+				Span::styled(project.name.clone(), project.style),
+				Span::raw(format!(" | {}", format_duration(project.duration))),
+			]));
+		}
+	}
+
+	let panel = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Week Stats"));
+	frame.render_widget(panel, area);
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 	let footer_lines = match &app.mode {
 		InputMode::Normal => vec![
-			Line::from("Tab focus | j/k or arrows move | Enter start/stop | q quit"),
-			Line::from("p project | c category | t task | s start(note) | x stop(note) | l manual log | o switch ledger"),
-			Line::from(app.status.clone()),
+			Line::from(
+				"Tab pane | arrows/hjkl navigate | Enter toggle task | q quit",
+			),
+			Line::from(
+				"space start/stop(explorer) | o new task in project | p project | c category | t task | s/x start/stop note | g switch ledger",
+			),
+			Line::from(format!(
+				"{}{}",
+				app.status,
+				if app.focus == FocusPane::Day {
+					format!(" | {}", app.day_edit_hint())
+				} else {
+					String::new()
+				}
+			)),
 		],
 		InputMode::Prompt(prompt) => vec![
 			Line::from(prompt.title.clone()),
@@ -209,51 +331,61 @@ fn draw_dashboard(
 		],
 	};
 
-	let footer = Paragraph::new(footer_lines).block(Block::default().borders(Borders::ALL).title("Input"));
-	frame.render_widget(footer, layout[3]);
-
-	if let InputMode::Select(select) = &app.mode {
-		render_select_popup(frame, select);
-	}
+	let footer = Paragraph::new(footer_lines).block(Block::default().borders(Borders::ALL).title("Shortcuts"));
+	frame.render_widget(footer, area);
 }
 
-fn render_list_panel(
-	frame: &mut Frame,
-	area: Rect,
-	title: &str,
-	focused: bool,
-	rows: &[DisplayRow],
-	selected_index: usize,
-) {
-	let items = if rows.is_empty() {
-		vec![ListItem::new("(empty)")]
+fn render_day_row_line(row: &DaySessionRow, selected_field: DayField, is_selected: bool) -> Line<'static> {
+	let lane_text = lane_text(row.lane, row.lane_count);
+	let start_text = row.display_start.format("%H:%M").to_string();
+	let end_text = row.display_stop.format("%H:%M").to_string();
+
+	let start_style = if is_selected && selected_field == DayField::Start {
+		Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+	} else if row.start_event_index.is_some() {
+		Style::default()
 	} else {
-		rows
-			.iter()
-			.map(|row| ListItem::new(row.line.clone()))
-			.collect::<Vec<_>>()
+		Style::default().fg(Color::DarkGray)
+	};
+	let end_style = if is_selected && selected_field == DayField::End {
+		Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+	} else if row.stop_event_index.is_some() {
+		Style::default()
+	} else {
+		Style::default().fg(Color::DarkGray)
 	};
 
-	let block = Block::default()
-		.borders(Borders::ALL)
-		.title(title)
-		.border_style(if focused {
-			Style::default()
-				.fg(FOCUSED_PANEL_BORDER_COLOR)
-				.add_modifier(Modifier::BOLD)
-		} else {
-			Style::default().fg(INACTIVE_PANEL_BORDER_COLOR)
-		});
+	let mut spans = vec![
+		Span::styled(format!("{lane_text} "), Style::default().fg(Color::DarkGray)),
+		Span::styled(start_text, start_style),
+		Span::raw(" -> "),
+		Span::styled(end_text, end_style),
+		Span::raw(format!(" {} | ", format_duration(row.display_stop - row.display_start))),
+		Span::styled(row.project_name.clone(), row.project_style),
+		Span::raw(format!(" | {}", row.task_title)),
+	];
 
-	let list = List::new(items)
-		.block(block)
-		.highlight_style(Style::default().bg(HIGHLIGHT_BACKGROUND_COLOR).add_modifier(Modifier::BOLD));
-
-	let mut state = ListState::default();
-	if !rows.is_empty() {
-		state.select(Some(selected_index.min(rows.len().saturating_sub(1))));
+	if let Some(note) = &row.note {
+		spans.push(Span::raw(format!(" | {note}")));
 	}
-	frame.render_stateful_widget(list, area, &mut state);
+
+	Line::from(spans)
+}
+
+fn lane_text(lane: usize, lane_count: usize) -> String {
+	let width = lane_count.min(5);
+	let mut out = String::new();
+	for index in 0..width {
+		if index == lane {
+			out.push('*');
+		} else {
+			out.push('|');
+		}
+	}
+	if lane_count > width {
+		out.push('+');
+	}
+	out
 }
 
 fn render_select_popup(frame: &mut Frame, select: &SelectState) {
@@ -283,10 +415,7 @@ fn render_select_popup(frame: &mut Frame, select: &SelectState) {
 				.title(format!("{} ({current}/{total})", select.title)),
 		)
 		.highlight_symbol(">> ")
-		.highlight_style(
-			Style::default()
-				.bg(HIGHLIGHT_BACKGROUND_COLOR),
-		);
+		.highlight_style(Style::default().bg(HIGHLIGHT_BACKGROUND_COLOR));
 
 	let mut state = ListState::default();
 	if !select.options.is_empty() {
@@ -323,21 +452,82 @@ fn handle_normal_key(
 	view: &ViewModel,
 ) -> bool {
 	match code {
-		KeyCode::Char('q') | KeyCode::Esc => true,
+		KeyCode::Char('q') => true,
+		KeyCode::Esc => {
+			if app.focus == FocusPane::Explorer {
+				if let ExplorerMode::ProjectTasks { .. } = app.explorer_mode {
+					app.explorer_mode = ExplorerMode::Projects;
+					app.explorer_index = 0;
+					app.status = "Back to projects".to_string();
+					return false;
+				}
+			}
+			true
+		}
 		KeyCode::Tab => {
 			app.focus = app.focus.next();
+			app.clear_day_edit_buffer();
 			false
 		}
 		KeyCode::BackTab => {
 			app.focus = app.focus.prev();
+			app.clear_day_edit_buffer();
 			false
 		}
 		KeyCode::Up | KeyCode::Char('k') => {
-			app.move_selection(-1, view);
+			match app.focus {
+				FocusPane::Calendar => app.shift_selected_day(-7),
+				FocusPane::Day => app.move_day_selection(-1, view),
+				FocusPane::Explorer => app.move_explorer_selection(-1, view),
+			}
 			false
 		}
 		KeyCode::Down | KeyCode::Char('j') => {
-			app.move_selection(1, view);
+			match app.focus {
+				FocusPane::Calendar => app.shift_selected_day(7),
+				FocusPane::Day => app.move_day_selection(1, view),
+				FocusPane::Explorer => app.move_explorer_selection(1, view),
+			}
+			false
+		}
+		KeyCode::Left | KeyCode::Char('h') => {
+			match app.focus {
+				FocusPane::Calendar => app.shift_selected_day(-1),
+				FocusPane::Day => {
+					app.day_field = DayField::Start;
+					app.clear_day_edit_buffer();
+				}
+				FocusPane::Explorer => {}
+			}
+			false
+		}
+		KeyCode::Right | KeyCode::Char('l') => {
+			match app.focus {
+				FocusPane::Calendar => app.shift_selected_day(1),
+				FocusPane::Day => {
+					app.day_field = DayField::End;
+					app.clear_day_edit_buffer();
+				}
+				FocusPane::Explorer => {}
+			}
+			false
+		}
+		KeyCode::Char('n') => {
+			app.shift_selected_month(1);
+			false
+		}
+		KeyCode::Char('N') => {
+			app.shift_selected_month(-1);
+			false
+		}
+		KeyCode::Backspace => {
+			if app.focus == FocusPane::Day {
+				app.day_edit_buffer.pop();
+			}
+			false
+		}
+		KeyCode::Char(value) if value.is_ascii_digit() && app.focus == FocusPane::Day => {
+			handle_day_digit_input(app, value, ledger, ledger_path.as_path(), view);
 			false
 		}
 		KeyCode::Char('p') => {
@@ -350,6 +540,21 @@ fn handle_normal_key(
 		}
 		KeyCode::Char('t') => {
 			match build_task_project_select(ledger) {
+				Ok(select) => app.mode = InputMode::Select(select),
+				Err(err) => app.status = err,
+			}
+			false
+		}
+		KeyCode::Char('o') => {
+			if let Some(project_id) = app.selected_project_for_new_task(view) {
+				app.mode = InputMode::Select(build_task_category_select(ledger, project_id));
+			} else {
+				app.status = "Select a project in Explorer first".to_string();
+			}
+			false
+		}
+		KeyCode::Char('g') => {
+			match build_ledger_switch_select(ledger_path.as_path()) {
 				Ok(select) => app.mode = InputMode::Select(select),
 				Err(err) => app.status = err,
 			}
@@ -377,25 +582,58 @@ fn handle_normal_key(
 			}
 			false
 		}
-		KeyCode::Char('l') => {
-			if let Some(task_id) = app.selected_task_id(view) {
-				app.mode = InputMode::Prompt(PromptState::new(
-					"Manual log start (RFC3339)",
-					PromptKind::ManualLogStart { task_id },
-				));
-			} else {
-				app.status = "Select a task first".to_string();
-			}
-			false
-		}
-		KeyCode::Char('o') => {
-			match build_ledger_switch_select(ledger_path.as_path()) {
-				Ok(select) => app.mode = InputMode::Select(select),
-				Err(err) => app.status = err,
+		KeyCode::Char(' ') => {
+			if app.focus == FocusPane::Explorer {
+				if let Some(task_id) = app.selected_task_id(view) {
+					let result = if snapshot.active_tasks.contains_key(&task_id) {
+						stop_task(ledger, ledger_path.as_path(), &task_id, None)
+					} else {
+						start_task(ledger, ledger_path.as_path(), &task_id, None)
+					};
+					app.status = match result {
+						Ok(message) => message,
+						Err(err) => format!("error: {err}"),
+					};
+				}
 			}
 			false
 		}
 		KeyCode::Enter => {
+			if app.focus == FocusPane::Explorer {
+				match app.selected_explorer_row_kind(view) {
+					Some(ExplorerRowKind::Project {
+						project_id,
+						project_name,
+					}) => {
+						app.explorer_mode = ExplorerMode::ProjectTasks {
+							project_id,
+							project_name,
+						};
+						app.explorer_index = 0;
+					}
+					Some(ExplorerRowKind::Category { key }) => {
+						if app.explorer_collapsed_categories.contains(&key) {
+							app.explorer_collapsed_categories.remove(&key);
+						} else {
+							app.explorer_collapsed_categories.insert(key);
+						}
+					}
+					Some(ExplorerRowKind::Task { task_id, .. }) => {
+						let result = if snapshot.active_tasks.contains_key(&task_id) {
+							stop_task(ledger, ledger_path.as_path(), &task_id, None)
+						} else {
+							start_task(ledger, ledger_path.as_path(), &task_id, None)
+						};
+						app.status = match result {
+							Ok(message) => message,
+							Err(err) => format!("error: {err}"),
+						};
+					}
+					Some(ExplorerRowKind::Empty) | None => {}
+				}
+				return false;
+			}
+
 			if let Some(task_id) = app.selected_task_id(view) {
 				let result = if snapshot.active_tasks.contains_key(&task_id) {
 					stop_task(ledger, ledger_path.as_path(), &task_id, None)
@@ -412,6 +650,93 @@ fn handle_normal_key(
 			false
 		}
 		_ => false,
+	}
+}
+
+fn handle_day_digit_input(app: &mut App, digit: char, ledger: &mut Ledger, ledger_path: &Path, view: &ViewModel) {
+	if view.day_rows.is_empty() {
+		app.status = "No sessions on selected day".to_string();
+		return;
+	}
+
+	app.day_edit_buffer.push(digit);
+	if app.day_edit_buffer.len() < 4 {
+		return;
+	}
+
+	let buffer = app.day_edit_buffer.clone();
+	app.day_edit_buffer.clear();
+
+	let hour = buffer[0..2].parse::<u32>();
+	let minute = buffer[2..4].parse::<u32>();
+	let (hour, minute) = match (hour, minute) {
+		(Ok(hour), Ok(minute)) if hour < 24 && minute < 60 => (hour, minute),
+		_ => {
+			app.status = format!("invalid time '{buffer}', expected HHMM");
+			return;
+		}
+	};
+
+	let Some(row) = view.day_rows.get(app.day_index) else {
+		app.status = "No selected session".to_string();
+		return;
+	};
+
+	let base_date = match app.day_field {
+		DayField::Start => row.start.date_naive(),
+		DayField::End => row.stop.date_naive(),
+	};
+	let Some(naive) = base_date.and_hms_opt(hour, minute, 0) else {
+		app.status = "invalid clock time".to_string();
+		return;
+	};
+	let next_timestamp = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+
+	match app.day_field {
+		DayField::Start => {
+			let Some(event_index) = row.start_event_index else {
+				app.status = "session start cannot be edited".to_string();
+				return;
+			};
+			if next_timestamp >= row.stop {
+				app.status = "start must be before end".to_string();
+				return;
+			}
+
+			if !matches!(ledger.events.get(event_index).map(|event| &event.kind), Some(EventKind::Start { .. })) {
+				app.status = "unable to edit start: event mismatch".to_string();
+				return;
+			}
+
+			ledger.events[event_index].timestamp = next_timestamp;
+			if let Err(err) = persist(ledger_path, ledger) {
+				app.status = format!("error: {err}");
+				return;
+			}
+			app.status = format!("updated start to {}", next_timestamp.format("%H:%M"));
+		}
+		DayField::End => {
+			let Some(event_index) = row.stop_event_index else {
+				app.status = "session end cannot be edited while task is running".to_string();
+				return;
+			};
+			if next_timestamp <= row.start {
+				app.status = "end must be after start".to_string();
+				return;
+			}
+
+			if !matches!(ledger.events.get(event_index).map(|event| &event.kind), Some(EventKind::Stop { .. })) {
+				app.status = "unable to edit end: event mismatch".to_string();
+				return;
+			}
+
+			ledger.events[event_index].timestamp = next_timestamp;
+			if let Err(err) = persist(ledger_path, ledger) {
+				app.status = format!("error: {err}");
+				return;
+			}
+			app.status = format!("updated end to {}", next_timestamp.format("%H:%M"));
+		}
 	}
 }
 
@@ -548,35 +873,6 @@ fn submit_prompt(
 		PromptKind::StopTaskNote { task_id } => {
 			let note = optional_text(&prompt.input);
 			stop_task(ledger, ledger_path, &task_id, note).map(PromptOutcome::Done)
-		}
-		PromptKind::ManualLogStart { task_id } => {
-			let start = parse_datetime(required_text(&prompt.input, "start timestamp")?.as_str())?;
-			Ok(PromptOutcome::NextPrompt(PromptState::new(
-				"Manual log stop (RFC3339)",
-				PromptKind::ManualLogStop { task_id, start },
-			)))
-		}
-		PromptKind::ManualLogStop { task_id, start } => {
-			let stop = parse_datetime(required_text(&prompt.input, "stop timestamp")?.as_str())?;
-			Ok(PromptOutcome::NextPrompt(PromptState::new(
-				"Manual log note (optional)",
-				PromptKind::ManualLogNote {
-					task_id,
-					start,
-					stop,
-				},
-			)))
-		}
-		PromptKind::ManualLogNote {
-			task_id,
-			start,
-			stop,
-		} => {
-			let note = optional_text(&prompt.input);
-			let task_label = task_label(ledger, &task_id);
-			ledger.add_manual_session(&task_id, start, stop, note)?;
-			persist(ledger_path, ledger)?;
-			Ok(PromptOutcome::Done(format!("recorded manual session for: {task_label}")))
 		}
 	}
 }
@@ -735,143 +1031,353 @@ fn build_ledger_switch_select(current_path: &Path) -> Result<SelectState, String
 	Ok(select)
 }
 
-fn build_view(ledger: &Ledger, snapshot: &LedgerSnapshot, now: DateTime<Utc>) -> ViewModel {
-	let mut running_rows = Vec::new();
-	let mut running_ids = Vec::new();
-	let mut running_entries = snapshot
-		.active_tasks
-		.iter()
-		.map(|(task_id, active)| (task_id.clone(), active.started_at, active.note.clone()))
-		.collect::<Vec<_>>();
-	running_entries.sort_by_key(|(_, started_at, _)| *started_at);
-	for (task_id, started_at, note) in running_entries {
-		let task = ledger.task(&task_id);
-		let title = task
-			.map(|task| task.short_description())
-			.unwrap_or_else(|| "Unknown task".to_string());
-		let project_name = task
-			.and_then(|task| ledger.project(&task.project_id))
-			.map(|project| project.name.clone())
-			.unwrap_or_else(|| "Unknown project".to_string());
-		let project_style = task_style_for_id(ledger, &task_id);
-		let elapsed = format_duration(now - started_at);
-		let note = note.map(|note| format!(" note={note}")).unwrap_or_default();
-		running_rows.push(DisplayRow::new(Line::from(vec![
-			Span::raw(format!("{elapsed} | ")),
-			Span::styled(project_name, project_style),
-			Span::raw(format!(" | {title}{note}")),
-		])));
-		running_ids.push(task_id);
+fn build_view(app: &App, ledger: &Ledger, snapshot: &LedgerSnapshot, now: DateTime<Utc>) -> ViewModel {
+	let sessions = collect_sessions(ledger, now);
+	let (day_rows, day_total) = build_day_rows(app.selected_day, ledger, sessions);
+	let week_stats = build_week_stats(app.selected_day, ledger, snapshot);
+	let explorer_rows = build_explorer_rows(app, ledger, snapshot, &week_stats);
+
+	ViewModel {
+		day_rows,
+		day_total,
+		week_stats,
+		explorer_rows,
 	}
+}
 
-	let mut recent_rows = Vec::new();
-	let mut recent_ids = Vec::new();
-	for task_id in snapshot.recent_tasks.iter().take(30) {
-		let task = ledger.task(task_id);
-		let title = task
-			.map(|task| task.short_description())
-			.unwrap_or_else(|| "Unknown task".to_string());
-		let project_name = task
-			.and_then(|task| ledger.project(&task.project_id))
-			.map(|project| project.name.clone())
-			.unwrap_or_else(|| "Unknown project".to_string());
-		let project_style = task_style_for_id(ledger, task_id);
-		let today_total = format_duration(snapshot.total_for_day(now.date_naive(), task_id));
-		recent_rows.push(DisplayRow::new(Line::from(vec![
-			Span::styled(project_name, project_style),
-			Span::raw(format!(" | {title} | today {today_total}")),
-		])));
-		recent_ids.push(task_id.clone());
-	}
-
-	let mut tasks = ledger
-		.header
-		.tasks
-		.iter()
-		.filter(|task| !task.archived)
-		.collect::<Vec<_>>();
-	tasks.sort_by(|left, right| {
-		left.project_id
-			.cmp(&right.project_id)
-			.then_with(|| left.short_description().cmp(&right.short_description()))
-	});
-
-	let mut task_rows = Vec::new();
-	let mut task_ids = Vec::new();
-	for task in tasks {
-		let project_name = ledger
-			.project(&task.project_id)
-			.map(|project| project.name.clone())
-			.unwrap_or_else(|| "Unknown project".to_string());
-		let project_style = style_from_project_color(
-			ledger
-				.project(&task.project_id)
-				.and_then(|project| project.color.as_deref()),
-		);
-		let running = if snapshot.active_tasks.contains_key(&task.id) {
-			"RUN"
-		} else {
-			"   "
-		};
-		task_rows.push(DisplayRow::new(Line::from(vec![
-			Span::raw(format!("{running} | ")),
-			Span::styled(project_name, project_style),
-			Span::raw(format!(" | {}", task.short_description())),
-		])));
-		task_ids.push(task.id.clone());
-	}
-
-	let mut day_rows = Vec::new();
-	for (task_id, duration) in snapshot.totals_for_day(now.date_naive()).into_iter().take(8) {
-		let (project_name, title) = task_project_and_title(ledger, &task_id);
-		let project_style = task_style_for_id(ledger, &task_id);
-		day_rows.push(Line::from(vec![
-			Span::raw(format!("{} | ", format_duration(duration))),
-			Span::styled(project_name, project_style),
-			Span::raw(format!(" | {title}")),
-		]));
-	}
-
-	let event_rows = ledger
+fn collect_sessions(ledger: &Ledger, now: DateTime<Utc>) -> Vec<SessionRecord> {
+	let mut indexed_events = ledger
 		.events
 		.iter()
-		.rev()
-		.take(12)
-		.map(|event| match &event.kind {
+		.enumerate()
+		.collect::<Vec<(usize, &TimeEvent)>>();
+	indexed_events.sort_by(|left, right| {
+		left.1
+			.timestamp
+			.cmp(&right.1.timestamp)
+			.then_with(|| left.0.cmp(&right.0))
+	});
+
+	let mut active: HashMap<String, ActiveSessionRef> = HashMap::new();
+	let mut sessions = Vec::new();
+
+	for (index, event) in indexed_events {
+		match &event.kind {
 			EventKind::Start { task_id, note } => {
-				let (_, title) = task_project_and_title(ledger, task_id);
-				format!(
-				"{} start {}{}",
-				event.timestamp.format("%H:%M:%S"),
-				title,
-				note
-					.as_ref()
-					.map(|value| format!(" note={value}"))
-					.unwrap_or_default()
-			)}
-			EventKind::Stop { task_id, note } => {
-				let (_, title) = task_project_and_title(ledger, task_id);
-				format!(
-				"{} stop {}{}",
-				event.timestamp.format("%H:%M:%S"),
-				title,
-				note
-					.as_ref()
-					.map(|value| format!(" note={value}"))
-					.unwrap_or_default()
-			)}
+				active.insert(
+					task_id.clone(),
+					ActiveSessionRef {
+						started_at: event.timestamp,
+						note: note.clone(),
+						start_event_index: index,
+					},
+				);
+			}
+			EventKind::Stop { task_id, .. } => {
+				if let Some(active_session) = active.remove(task_id) {
+					if event.timestamp > active_session.started_at {
+						sessions.push(SessionRecord {
+							task_id: task_id.clone(),
+							start: active_session.started_at,
+							stop: event.timestamp,
+							note: active_session.note,
+							start_event_index: Some(active_session.start_event_index),
+							stop_event_index: Some(index),
+						});
+					}
+				}
+			}
+		}
+	}
+
+	for (task_id, active_session) in active {
+		if now > active_session.started_at {
+			sessions.push(SessionRecord {
+				task_id,
+				start: active_session.started_at,
+				stop: now,
+				note: active_session.note,
+				start_event_index: Some(active_session.start_event_index),
+				stop_event_index: None,
+			});
+		}
+	}
+
+	sessions
+}
+
+fn build_day_rows(selected_day: NaiveDate, ledger: &Ledger, sessions: Vec<SessionRecord>) -> (Vec<DaySessionRow>, Duration) {
+	let day_start = day_start(selected_day);
+	let day_end = day_start + Duration::days(1);
+
+	let mut rows = sessions
+		.into_iter()
+		.filter_map(|session| {
+			if session.stop <= day_start || session.start >= day_end {
+				return None;
+			}
+
+			let display_start = if session.start < day_start {
+				day_start
+			} else {
+				session.start
+			};
+			let display_stop = if session.stop > day_end { day_end } else { session.stop };
+			if display_stop <= display_start {
+				return None;
+			}
+
+			let (project_name, task_title) = task_project_and_title(ledger, &session.task_id);
+			let project_style = task_style_for_id(ledger, &session.task_id);
+
+			Some(DaySessionRow {
+				task_id: session.task_id,
+				project_name,
+				task_title,
+				project_style,
+				note: session.note,
+				start: session.start,
+				stop: session.stop,
+				display_start,
+				display_stop,
+				start_event_index: session.start_event_index,
+				stop_event_index: session.stop_event_index,
+				lane: 0,
+				lane_count: 1,
+			})
 		})
 		.collect::<Vec<_>>();
 
-	ViewModel {
-		running_rows,
-		running_ids,
-		recent_rows,
-		recent_ids,
-		task_rows,
-		task_ids,
-		day_rows,
-		event_rows,
+	rows.sort_by(|left, right| {
+		left.display_start
+			.cmp(&right.display_start)
+			.then_with(|| left.display_stop.cmp(&right.display_stop))
+			.then_with(|| left.task_title.cmp(&right.task_title))
+	});
+
+	let mut lane_ends = Vec::<DateTime<Utc>>::new();
+	for row in &mut rows {
+		let lane = lane_ends
+			.iter()
+			.position(|lane_end| *lane_end <= row.display_start)
+			.unwrap_or_else(|| {
+				lane_ends.push(row.display_start);
+				lane_ends.len() - 1
+			});
+		lane_ends[lane] = row.display_stop;
+		row.lane = lane;
+	}
+	let lane_count = lane_ends.len().max(1);
+	for row in &mut rows {
+		row.lane_count = lane_count;
+	}
+
+	let day_total = rows
+		.iter()
+		.fold(Duration::zero(), |acc, row| acc + (row.display_stop - row.display_start));
+
+	(rows, day_total)
+}
+
+fn build_week_stats(selected_day: NaiveDate, ledger: &Ledger, snapshot: &LedgerSnapshot) -> WeekStatsView {
+	let week_start = start_of_week(selected_day);
+	let mut daily = Vec::new();
+	let mut total = Duration::zero();
+	let mut max_day = Duration::zero();
+	let mut active_days = 0usize;
+	let mut project_totals: HashMap<String, Duration> = HashMap::new();
+
+	for offset in 0..7 {
+		let day = week_start + Duration::days(offset);
+		let durations = snapshot
+			.daily_task_totals
+			.get(&day)
+			.cloned()
+			.unwrap_or_default();
+		let day_total = durations
+			.values()
+			.fold(Duration::zero(), |acc, value| acc + *value);
+
+		if day_total > Duration::zero() {
+			active_days += 1;
+		}
+		if day_total > max_day {
+			max_day = day_total;
+		}
+		total += day_total;
+		daily.push((day, day_total));
+
+		for (task_id, duration) in durations {
+			if let Some(task) = ledger.task(&task_id) {
+				*project_totals
+					.entry(task.project_id.clone())
+					.or_insert_with(Duration::zero) += duration;
+			}
+		}
+	}
+
+	let avg_per_day = Duration::seconds(total.num_seconds() / 7);
+
+	let mut top_projects = project_totals
+		.iter()
+		.map(|(project_id, duration)| {
+			let project = ledger.project(project_id);
+			let name = project
+				.map(|project| project.name.clone())
+				.unwrap_or_else(|| "Unknown project".to_string());
+			let style = style_from_project_color(project.and_then(|project| project.color.as_deref()));
+			ProjectSummaryRow {
+				name,
+				style,
+				duration: *duration,
+			}
+		})
+		.collect::<Vec<_>>();
+	top_projects.sort_by(|left, right| right.duration.cmp(&left.duration).then_with(|| left.name.cmp(&right.name)));
+
+	WeekStatsView {
+		week_start,
+		daily,
+		total,
+		avg_per_day,
+		max_day,
+		active_days,
+		project_totals,
+		top_projects,
+	}
+}
+
+fn build_explorer_rows(
+	app: &App,
+	ledger: &Ledger,
+	snapshot: &LedgerSnapshot,
+	week_stats: &WeekStatsView,
+) -> Vec<ExplorerRow> {
+	match &app.explorer_mode {
+		ExplorerMode::Projects => {
+			let mut projects = ledger
+				.header
+				.projects
+				.iter()
+				.filter(|project| !project.archived)
+				.collect::<Vec<_>>();
+			projects.sort_by(|left, right| left.name.cmp(&right.name).then_with(|| left.id.cmp(&right.id)));
+
+			if projects.is_empty() {
+				return vec![ExplorerRow::empty("(no active projects)")];
+			}
+
+			projects
+				.into_iter()
+				.map(|project| {
+					let task_count = ledger
+						.header
+						.tasks
+						.iter()
+						.filter(|task| !task.archived && task.project_id == project.id)
+						.count();
+					let week_total = week_stats
+						.project_totals
+						.get(&project.id)
+						.copied()
+						.unwrap_or_else(Duration::zero);
+					let style = style_from_project_color(project.color.as_deref());
+					ExplorerRow {
+						line: Line::from(vec![
+							Span::styled(project.name.clone(), style),
+							Span::raw(format!(" | tasks {} | week {}", task_count, format_duration(week_total))),
+						]),
+						kind: ExplorerRowKind::Project {
+							project_id: project.id.clone(),
+							project_name: project.name.clone(),
+						},
+					}
+				})
+				.collect::<Vec<_>>()
+		}
+		ExplorerMode::ProjectTasks {
+			project_id,
+			project_name: _,
+		} => {
+			let mut tasks = ledger
+				.header
+				.tasks
+				.iter()
+				.filter(|task| !task.archived && task.project_id == *project_id)
+				.collect::<Vec<&Task>>();
+
+			if tasks.is_empty() {
+				return vec![ExplorerRow::empty("(no tasks in this project)")];
+			}
+
+			tasks.sort_by(|left, right| {
+				left.category_id
+					.cmp(&right.category_id)
+					.then_with(|| left.short_description().cmp(&right.short_description()))
+					.then_with(|| left.id.cmp(&right.id))
+			});
+
+			let mut grouped: BTreeMap<String, (String, Vec<&Task>)> = BTreeMap::new();
+			for task in tasks {
+				let label = task
+					.category_id
+					.as_ref()
+					.and_then(|id| ledger.category(id))
+					.map(|category| category.name.clone())
+					.unwrap_or_else(|| "Uncategorized".to_string());
+				let key = explorer_category_key(project_id, task.category_id.as_deref());
+				grouped
+					.entry(key)
+					.and_modify(|(_, entries)| entries.push(task))
+					.or_insert_with(|| (label, vec![task]));
+			}
+
+			let mut rows = Vec::new();
+			for (key, (label, mut category_tasks)) in grouped {
+				category_tasks.sort_by(|left, right| {
+					left
+						.short_description()
+						.cmp(&right.short_description())
+						.then_with(|| left.id.cmp(&right.id))
+				});
+
+				let is_collapsed = app.explorer_collapsed_categories.contains(&key);
+				rows.push(ExplorerRow {
+					line: Line::from(format!(
+						"{} {} ({})",
+						if is_collapsed { "[+]" } else { "[-]" },
+						label,
+						category_tasks.len()
+					)),
+					kind: ExplorerRowKind::Category { key: key.clone() },
+				});
+
+				if is_collapsed {
+					continue;
+				}
+
+				for task in category_tasks {
+					let is_running = snapshot.active_tasks.contains_key(&task.id);
+					rows.push(ExplorerRow {
+						line: Line::from(format!(
+							"  {} {}",
+							if is_running { "RUN" } else { "   " },
+							task.short_description()
+						)),
+						kind: ExplorerRowKind::Task {
+							task_id: task.id.clone(),
+							project_id: project_id.clone(),
+						},
+					});
+				}
+			}
+
+			if rows.is_empty() {
+				vec![ExplorerRow::empty("(no tasks)")]
+			} else {
+				rows
+			}
+		}
 	}
 }
 
@@ -943,12 +1449,6 @@ fn optional_text(input: &str) -> Option<String> {
 	}
 }
 
-fn parse_datetime(input: &str) -> Result<DateTime<Utc>, String> {
-	DateTime::parse_from_rfc3339(input)
-		.map(|datetime| datetime.with_timezone(&Utc))
-		.map_err(|_| "invalid datetime, expected RFC3339".to_string())
-}
-
 fn task_label(ledger: &Ledger, task_id: &str) -> String {
 	ledger
 		.task(task_id)
@@ -1008,6 +1508,65 @@ fn color_from_name(color_name: &str) -> Option<Color> {
 		"light_cyan" => Some(Color::LightCyan),
 		"white" => Some(Color::White),
 		_ => None,
+	}
+}
+
+fn border_style(focused: bool) -> Style {
+	if focused {
+		Style::default()
+			.fg(FOCUSED_PANEL_BORDER_COLOR)
+			.add_modifier(Modifier::BOLD)
+	} else {
+		Style::default().fg(INACTIVE_PANEL_BORDER_COLOR)
+	}
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+	let first_of_next = if month == 12 {
+		NaiveDate::from_ymd_opt(year + 1, 1, 1).expect("next year date should be valid")
+	} else {
+		NaiveDate::from_ymd_opt(year, month + 1, 1).expect("next month date should be valid")
+	};
+	(first_of_next - Duration::days(1)).day()
+}
+
+fn first_day_of_month(day: NaiveDate) -> NaiveDate {
+	NaiveDate::from_ymd_opt(day.year(), day.month(), 1).expect("first day of month must be valid")
+}
+
+fn start_of_week(day: NaiveDate) -> NaiveDate {
+	let days_from_monday = day.weekday().number_from_monday() as i64 - 1;
+	day - Duration::days(days_from_monday)
+}
+
+fn day_start(day: NaiveDate) -> DateTime<Utc> {
+	DateTime::<Utc>::from_naive_utc_and_offset(
+		day.and_hms_opt(0, 0, 0).expect("midnight must be valid"),
+		Utc,
+	)
+}
+
+fn shift_month(day: NaiveDate, delta: i32) -> NaiveDate {
+	let mut year = day.year();
+	let mut month = day.month() as i32 + delta;
+	while month > 12 {
+		year += 1;
+		month -= 12;
+	}
+	while month < 1 {
+		year -= 1;
+		month += 12;
+	}
+	let month_u32 = month as u32;
+	let max_day = days_in_month(year, month_u32);
+	let target_day = day.day().min(max_day);
+	NaiveDate::from_ymd_opt(year, month_u32, target_day).expect("shifted month date must be valid")
+}
+
+fn explorer_category_key(project_id: &str, category_id: Option<&str>) -> String {
+	match category_id {
+		Some(category_id) => format!("{project_id}:{category_id}"),
+		None => format!("{project_id}:__uncategorized"),
 	}
 }
 
@@ -1112,18 +1671,6 @@ enum PromptKind {
 	StopTaskNote {
 		task_id: String,
 	},
-	ManualLogStart {
-		task_id: String,
-	},
-	ManualLogStop {
-		task_id: String,
-		start: DateTime<Utc>,
-	},
-	ManualLogNote {
-		task_id: String,
-		start: DateTime<Utc>,
-		stop: DateTime<Utc>,
-	},
 }
 
 #[derive(Debug, Clone)]
@@ -1140,27 +1687,42 @@ enum SelectKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusPane {
-	Running,
-	Recent,
-	Tasks,
+	Calendar,
+	Day,
+	Explorer,
 }
 
 impl FocusPane {
 	fn next(self) -> Self {
 		match self {
-			FocusPane::Running => FocusPane::Recent,
-			FocusPane::Recent => FocusPane::Tasks,
-			FocusPane::Tasks => FocusPane::Running,
+			FocusPane::Calendar => FocusPane::Day,
+			FocusPane::Day => FocusPane::Explorer,
+			FocusPane::Explorer => FocusPane::Calendar,
 		}
 	}
 
 	fn prev(self) -> Self {
 		match self {
-			FocusPane::Running => FocusPane::Tasks,
-			FocusPane::Recent => FocusPane::Running,
-			FocusPane::Tasks => FocusPane::Recent,
+			FocusPane::Calendar => FocusPane::Explorer,
+			FocusPane::Day => FocusPane::Calendar,
+			FocusPane::Explorer => FocusPane::Day,
 		}
 	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DayField {
+	Start,
+	End,
+}
+
+#[derive(Debug, Clone)]
+enum ExplorerMode {
+	Projects,
+	ProjectTasks {
+		project_id: String,
+		project_name: String,
+	},
 }
 
 #[derive(Debug, Clone)]
@@ -1173,20 +1735,31 @@ enum InputMode {
 #[derive(Debug, Clone)]
 struct App {
 	focus: FocusPane,
-	running_index: usize,
-	recent_index: usize,
-	task_index: usize,
+	selected_day: NaiveDate,
+	calendar_month: NaiveDate,
+	day_index: usize,
+	day_field: DayField,
+	day_edit_buffer: String,
+	explorer_mode: ExplorerMode,
+	explorer_index: usize,
+	explorer_collapsed_categories: HashSet<String>,
 	mode: InputMode,
 	status: String,
 }
 
 impl Default for App {
 	fn default() -> Self {
+		let today = Utc::now().date_naive();
 		Self {
-			focus: FocusPane::Tasks,
-			running_index: 0,
-			recent_index: 0,
-			task_index: 0,
+			focus: FocusPane::Explorer,
+			selected_day: today,
+			calendar_month: first_day_of_month(today),
+			day_index: 0,
+			day_field: DayField::Start,
+			day_edit_buffer: String::new(),
+			explorer_mode: ExplorerMode::Projects,
+			explorer_index: 0,
+			explorer_collapsed_categories: HashSet::new(),
 			mode: InputMode::Normal,
 			status: "Ready".to_string(),
 		}
@@ -1195,57 +1768,72 @@ impl Default for App {
 
 impl App {
 	fn clamp_selection(&mut self, view: &ViewModel) {
-		if view.running_ids.is_empty() {
-			self.running_index = 0;
+		if view.day_rows.is_empty() {
+			self.day_index = 0;
 		} else {
-			self.running_index = self.running_index.min(view.running_ids.len() - 1);
+			self.day_index = self.day_index.min(view.day_rows.len() - 1);
 		}
 
-		if view.recent_ids.is_empty() {
-			self.recent_index = 0;
+		if view.explorer_rows.is_empty() {
+			self.explorer_index = 0;
 		} else {
-			self.recent_index = self.recent_index.min(view.recent_ids.len() - 1);
-		}
-
-		if view.task_ids.is_empty() {
-			self.task_index = 0;
-		} else {
-			self.task_index = self.task_index.min(view.task_ids.len() - 1);
+			self.explorer_index = self.explorer_index.min(view.explorer_rows.len() - 1);
 		}
 	}
 
-	fn move_selection(&mut self, delta: i32, view: &ViewModel) {
-		let (index, len) = match self.focus {
-			FocusPane::Running => (&mut self.running_index, view.running_ids.len()),
-			FocusPane::Recent => (&mut self.recent_index, view.recent_ids.len()),
-			FocusPane::Tasks => (&mut self.task_index, view.task_ids.len()),
-		};
+	fn shift_selected_day(&mut self, delta_days: i64) {
+		self.selected_day += Duration::days(delta_days);
+		self.calendar_month = first_day_of_month(self.selected_day);
+		self.day_index = 0;
+		self.clear_day_edit_buffer();
+	}
 
-		if len == 0 {
-			*index = 0;
+	fn shift_selected_month(&mut self, delta_months: i32) {
+		self.selected_day = shift_month(self.selected_day, delta_months);
+		self.calendar_month = first_day_of_month(self.selected_day);
+		self.day_index = 0;
+		self.clear_day_edit_buffer();
+	}
+
+	fn move_day_selection(&mut self, delta: i32, view: &ViewModel) {
+		if view.day_rows.is_empty() {
+			self.day_index = 0;
 			return;
 		}
 
 		if delta > 0 {
-			*index = (*index + delta as usize).min(len - 1);
+			self.day_index = (self.day_index + delta as usize).min(view.day_rows.len() - 1);
 		} else {
-			*index = index.saturating_sub(delta.unsigned_abs() as usize);
+			self.day_index = self.day_index.saturating_sub(delta.unsigned_abs() as usize);
+		}
+		self.clear_day_edit_buffer();
+	}
+
+	fn move_explorer_selection(&mut self, delta: i32, view: &ViewModel) {
+		if view.explorer_rows.is_empty() {
+			self.explorer_index = 0;
+			return;
+		}
+
+		if delta > 0 {
+			self.explorer_index = (self.explorer_index + delta as usize).min(view.explorer_rows.len() - 1);
+		} else {
+			self.explorer_index = self.explorer_index.saturating_sub(delta.unsigned_abs() as usize);
 		}
 	}
 
 	fn selected_task_id(&self, view: &ViewModel) -> Option<String> {
 		match self.focus {
-			FocusPane::Running => view.running_ids.get(self.running_index).cloned(),
-			FocusPane::Recent => view.recent_ids.get(self.recent_index).cloned(),
-			FocusPane::Tasks => view.task_ids.get(self.task_index).cloned(),
+			FocusPane::Calendar => None,
+			FocusPane::Day => view.day_rows.get(self.day_index).map(|row| row.task_id.clone()),
+			FocusPane::Explorer => match self.selected_explorer_row_kind(view) {
+				Some(ExplorerRowKind::Task { task_id, .. }) => Some(task_id),
+				_ => None,
+			},
 		}
 	}
 
 	fn selected_active_task_id(&self, view: &ViewModel, snapshot: &LedgerSnapshot) -> Option<String> {
-		if self.focus == FocusPane::Running {
-			return view.running_ids.get(self.running_index).cloned();
-		}
-
 		let task_id = self.selected_task_id(view)?;
 		if snapshot.active_tasks.contains_key(&task_id) {
 			Some(task_id)
@@ -1253,27 +1841,134 @@ impl App {
 			None
 		}
 	}
+
+	fn selected_project_for_new_task(&self, view: &ViewModel) -> Option<String> {
+		if let ExplorerMode::ProjectTasks { project_id, .. } = &self.explorer_mode {
+			return Some(project_id.clone());
+		}
+
+		match self.selected_explorer_row_kind(view) {
+			Some(ExplorerRowKind::Project { project_id, .. }) => Some(project_id),
+			Some(ExplorerRowKind::Task { project_id, .. }) => Some(project_id),
+			_ => None,
+		}
+	}
+
+	fn selected_explorer_row_kind(&self, view: &ViewModel) -> Option<ExplorerRowKind> {
+		view.explorer_rows
+			.get(self.explorer_index)
+			.map(|row| row.kind.clone())
+	}
+
+	fn clear_day_edit_buffer(&mut self) {
+		self.day_edit_buffer.clear();
+	}
+
+	fn day_edit_hint(&self) -> String {
+		let field = if self.day_field == DayField::Start {
+			"start"
+		} else {
+			"end"
+		};
+		if self.day_edit_buffer.is_empty() {
+			return format!("Edit {field}: type HHMM");
+		}
+
+		let mut pending = self.day_edit_buffer.clone();
+		while pending.len() < 4 {
+			pending.push('_');
+		}
+		format!("Edit {field}: {pending}")
+	}
 }
 
 struct ViewModel {
-	running_rows: Vec<DisplayRow>,
-	running_ids: Vec<String>,
-	recent_rows: Vec<DisplayRow>,
-	recent_ids: Vec<String>,
-	task_rows: Vec<DisplayRow>,
-	task_ids: Vec<String>,
-	day_rows: Vec<Line<'static>>,
-	event_rows: Vec<String>,
+	day_rows: Vec<DaySessionRow>,
+	day_total: Duration,
+	week_stats: WeekStatsView,
+	explorer_rows: Vec<ExplorerRow>,
 }
 
-struct DisplayRow {
+#[derive(Clone)]
+struct DaySessionRow {
+	task_id: String,
+	project_name: String,
+	task_title: String,
+	project_style: Style,
+	note: Option<String>,
+	start: DateTime<Utc>,
+	stop: DateTime<Utc>,
+	display_start: DateTime<Utc>,
+	display_stop: DateTime<Utc>,
+	start_event_index: Option<usize>,
+	stop_event_index: Option<usize>,
+	lane: usize,
+	lane_count: usize,
+}
+
+#[derive(Clone)]
+struct WeekStatsView {
+	week_start: NaiveDate,
+	daily: Vec<(NaiveDate, Duration)>,
+	total: Duration,
+	avg_per_day: Duration,
+	max_day: Duration,
+	active_days: usize,
+	project_totals: HashMap<String, Duration>,
+	top_projects: Vec<ProjectSummaryRow>,
+}
+
+#[derive(Clone)]
+struct ProjectSummaryRow {
+	name: String,
+	style: Style,
+	duration: Duration,
+}
+
+#[derive(Clone)]
+struct ExplorerRow {
 	line: Line<'static>,
+	kind: ExplorerRowKind,
 }
 
-impl DisplayRow {
-	fn new(line: Line<'static>) -> Self {
-		Self { line }
+impl ExplorerRow {
+	fn empty(text: impl Into<String>) -> Self {
+		Self {
+			line: Line::from(text.into()),
+			kind: ExplorerRowKind::Empty,
+		}
 	}
+}
+
+#[derive(Debug, Clone)]
+enum ExplorerRowKind {
+	Empty,
+	Project {
+		project_id: String,
+		project_name: String,
+	},
+	Category {
+		key: String,
+	},
+	Task {
+		task_id: String,
+		project_id: String,
+	},
+}
+
+struct ActiveSessionRef {
+	started_at: DateTime<Utc>,
+	note: Option<String>,
+	start_event_index: usize,
+}
+
+struct SessionRecord {
+	task_id: String,
+	start: DateTime<Utc>,
+	stop: DateTime<Utc>,
+	note: Option<String>,
+	start_event_index: Option<usize>,
+	stop_event_index: Option<usize>,
 }
 
 pub fn print_event_log(ledger: &Ledger, limit: usize) {

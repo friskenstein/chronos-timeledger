@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{Duration, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
 
 use crate::domain::{format_duration, Ledger};
@@ -57,16 +57,6 @@ enum Command {
 	Stop {
 		#[arg(long)]
 		task: String,
-		#[arg(long)]
-		note: Option<String>,
-	},
-	Log {
-		#[arg(long)]
-		task: String,
-		#[arg(long)]
-		start: String,
-		#[arg(long)]
-		stop: String,
 		#[arg(long)]
 		note: Option<String>,
 	},
@@ -143,18 +133,6 @@ fn run() -> Result<(), Box<dyn Error>> {
 			save_ledger(&ledger_path, &ledger)?;
 			println!("stopped {task}");
 		}
-		Command::Log {
-			task,
-			start,
-			stop,
-			note,
-		} => {
-			let start = parse_datetime(&start)?;
-			let stop = parse_datetime(&stop)?;
-			ledger.add_manual_session(&task, start, stop, note)?;
-			save_ledger(&ledger_path, &ledger)?;
-			println!("recorded manual session for {task}");
-		}
 		Command::ListTasks => {
 			print_tasks(&ledger);
 		}
@@ -182,10 +160,6 @@ fn print_recent_ledgers(limit: usize) -> Result<(), Box<dyn Error>> {
 	}
 
 	Ok(())
-}
-
-fn parse_datetime(input: &str) -> Result<DateTime<Utc>, Box<dyn Error>> {
-	Ok(DateTime::parse_from_rfc3339(input)?.with_timezone(&Utc))
 }
 
 fn parse_day(input: Option<&str>) -> Result<NaiveDate, Box<dyn Error>> {

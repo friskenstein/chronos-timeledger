@@ -227,28 +227,6 @@ impl Ledger {
 		Ok(())
 	}
 
-	pub fn add_manual_session(
-		&mut self,
-		task_id: &str,
-		start: DateTime<Utc>,
-		stop: DateTime<Utc>,
-		note: Option<String>,
-	) -> Result<(), String> {
-		if self.task(task_id).is_none() {
-			return Err(format!("task not found: {task_id}"));
-		}
-
-		if stop <= start {
-			return Err("stop must be after start".to_string());
-		}
-
-		self.events
-			.push(TimeEvent::start(task_id.to_string(), start, note));
-		self.events
-			.push(TimeEvent::stop(task_id.to_string(), stop, None));
-		Ok(())
-	}
-
 	pub fn snapshot(&self, now: DateTime<Utc>) -> LedgerSnapshot {
 		let mut events = self.events.clone();
 		events.sort_by_key(|event| event.timestamp);
