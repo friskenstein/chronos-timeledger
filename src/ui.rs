@@ -208,12 +208,16 @@ fn render_explorer_panel(frame: &mut Frame, area: Rect, app: &App, view: &ViewMo
 
 fn render_selected_day_panel(frame: &mut Frame, area: Rect, app: &App, view: &ViewModel) {
 	let mut items = Vec::new();
+	let mut previous_task_id: Option<&str> = None;
 	for (index, row) in view.day_rows.iter().enumerate() {
-		items.push(ListItem::new(render_day_row_line(
+		let suppress_header = previous_task_id == Some(row.task_id.as_str());
+		items.push(render_day_row_item(
 			row,
+			suppress_header,
 			app.day_field,
 			index == app.day_index,
-		)));
+		));
+		previous_task_id = Some(row.task_id.as_str());
 	}
 
 	if items.is_empty() {
@@ -334,8 +338,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 	frame.render_widget(footer, area);
 }
 
-fn render_day_row_line(row: &DaySessionRow, selected_field: DayField, is_selected: bool) -> Line<'static> {
-	let lane_text = lane_text(row.lane, row.lane_count);
+fn render_day_row_item(
+	row: &DaySessionRow,
+	suppress_header: bool,
+	selected_field: DayField,
+	is_selected: bool,
+) -> ListItem<'static> {
 	let start_text = row.display_start.with_timezone(&Local).format("%H:%M").to_string();
 	let end_text = row.display_stop.with_timezone(&Local).format("%H:%M").to_string();
 
@@ -354,37 +362,27 @@ fn render_day_row_line(row: &DaySessionRow, selected_field: DayField, is_selecte
 		Style::default().fg(Color::DarkGray)
 	};
 
-	let mut spans = vec![
-		Span::styled(format!("{lane_text} "), Style::default().fg(Color::DarkGray)),
+	let mut timing_spans = vec![
 		Span::styled(start_text, start_style),
 		Span::raw(" -> "),
 		Span::styled(end_text, end_style),
-		Span::raw(format!(" {} | ", format_duration(row.display_stop - row.display_start))),
-		Span::styled(row.project_name.clone(), row.project_style),
-		Span::raw(format!(" | {}", row.task_title)),
+		Span::raw(format!(" {}", format_duration(row.display_stop - row.display_start))),
 	];
 
 	if let Some(note) = &row.note {
-		spans.push(Span::raw(format!(" | {note}")));
+		timing_spans.push(Span::raw(format!(" {note}")));
 	}
 
-	Line::from(spans)
-}
-
-fn lane_text(lane: usize, lane_count: usize) -> String {
-	let width = lane_count.min(5);
-	let mut out = String::new();
-	for index in 0..width {
-		if index == lane {
-			out.push('*');
-		} else {
-			out.push('|');
-		}
+	let time_line = Line::from(timing_spans);
+	if suppress_header {
+		ListItem::new(vec![time_line])
+	} else {
+		let header_line = Line::from(vec![
+			Span::styled(row.project_name.clone(), row.project_style),
+			Span::raw(format!(" | {}", row.task_title)),
+		]);
+		ListItem::new(vec![header_line, time_line])
 	}
-	if lane_count > width {
-		out.push('+');
-	}
-	out
 }
 
 fn render_select_popup(frame: &mut Frame, select: &SelectState) {
@@ -1277,8 +1275,6 @@ fn build_day_rows(selected_day: NaiveDate, ledger: &Ledger, sessions: &[SessionR
 				display_stop,
 				start_event_index: session.start_event_index,
 				stop_event_index: session.stop_event_index,
-				lane: 0,
-				lane_count: 1,
 			})
 		})
 		.collect::<Vec<_>>();
@@ -1289,23 +1285,6 @@ fn build_day_rows(selected_day: NaiveDate, ledger: &Ledger, sessions: &[SessionR
 			.then_with(|| left.display_stop.cmp(&right.display_stop))
 			.then_with(|| left.task_title.cmp(&right.task_title))
 	});
-
-	let mut lane_ends = Vec::<DateTime<Utc>>::new();
-	for row in &mut rows {
-		let lane = lane_ends
-			.iter()
-			.position(|lane_end| *lane_end <= row.display_start)
-			.unwrap_or_else(|| {
-				lane_ends.push(row.display_start);
-				lane_ends.len() - 1
-			});
-		lane_ends[lane] = row.display_stop;
-		row.lane = lane;
-	}
-	let lane_count = lane_ends.len().max(1);
-	for row in &mut rows {
-		row.lane_count = lane_count;
-	}
 
 	let day_total = rows
 		.iter()
@@ -2145,8 +2124,6 @@ struct DaySessionRow {
 	display_stop: DateTime<Utc>,
 	start_event_index: Option<usize>,
 	stop_event_index: Option<usize>,
-	lane: usize,
-	lane_count: usize,
 }
 
 #[derive(Clone)]
