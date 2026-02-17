@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, TimeZone, Utc};
-use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, ExecutableCommand};
 use ratatui::backend::CrosstermBackend;
@@ -78,7 +78,7 @@ fn run_event_loop(
 				}
 
 				let should_quit = match &app.mode {
-					InputMode::Prompt(_) => handle_prompt_key(&mut app, key.code, ledger, ledger_path),
+					InputMode::Prompt(_) => handle_prompt_key(&mut app, key, ledger, ledger_path),
 					InputMode::Select(_) => handle_select_key(&mut app, key.code, ledger, ledger_path),
 					InputMode::Normal => {
 						handle_normal_key(&mut app, key.code, ledger, ledger_path, &snapshot, &view)
@@ -121,8 +121,10 @@ fn draw_dashboard(frame: &mut Frame, app: &App, view: &ViewModel) {
 	render_week_stats_panel(frame, body[2], view);
 	render_footer(frame, layout[1], app);
 
-	if let InputMode::Select(select) = &app.mode {
-		render_select_popup(frame, select);
+	match &app.mode {
+		InputMode::Select(select) => render_select_popup(frame, select),
+		InputMode::Prompt(prompt) => render_prompt_popup(frame, prompt),
+		InputMode::Normal => {}
 	}
 }
 
@@ -304,7 +306,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 				"Tab pane | arrows/hjkl navigate | Enter open/collapse (explorer) | q quit",
 			),
 			Line::from(
-				"space start/stop (day+explorer) | d delete interval(day) | o new task | p project | c category | t task | s/x start/stop note | g switch ledger",
+				"space start/stop (day+explorer) | d delete interval(day) | o new task | p project | c category | t task | s session note | g switch ledger",
 			),
 			Line::from(format!(
 				"{}{}",
@@ -317,9 +319,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 			)),
 		],
 		InputMode::Prompt(prompt) => vec![
-			Line::from(prompt.title.clone()),
-			Line::from(format!("> {}", prompt.input)),
-			Line::from("Enter submit | Esc cancel"),
+			Line::from(format!("Prompt: {}", prompt.title)),
+			Line::from("Enter confirm | Ctrl+J newline"),
+			Line::from("Esc cancel"),
 		],
 		InputMode::Select(select) => vec![
 			Line::from(select.title.clone()),
@@ -419,6 +421,37 @@ fn render_select_popup(frame: &mut Frame, select: &SelectState) {
 		state.select(Some(select.selected.min(select.options.len().saturating_sub(1))));
 	}
 	frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_prompt_popup(frame: &mut Frame, prompt: &PromptState) {
+	let area = centered_rect(72, 60, frame.area());
+	frame.render_widget(Clear, area);
+
+	let mut lines = Vec::new();
+	if prompt.input.is_empty() {
+		lines.push(Line::from(""));
+	} else {
+		for part in prompt.input.split('\n') {
+			lines.push(Line::from(part.to_string()));
+		}
+		if prompt.input.ends_with('\n') {
+			lines.push(Line::from(""));
+		}
+	}
+
+	lines.push(Line::from(""));
+	lines.push(Line::from(Span::styled(
+		"Enter confirm | Ctrl+J newline | Esc cancel",
+		Style::default().fg(Color::DarkGray),
+	)));
+
+	let paragraph = Paragraph::new(lines).block(
+		Block::default()
+			.borders(Borders::ALL)
+			.title(prompt.title.clone())
+			.border_style(Style::default().fg(FOCUSED_PANEL_BORDER_COLOR).add_modifier(Modifier::BOLD)),
+	);
+	frame.render_widget(paragraph, area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -558,24 +591,40 @@ fn handle_normal_key(
 			false
 		}
 		KeyCode::Char('s') => {
-			if let Some(task_id) = app.selected_task_id(view) {
+			if app.focus == FocusPane::Day {
+				let Some(row) = view.day_rows.get(app.day_index) else {
+					app.status = "No selected interval in day view".to_string();
+					return false;
+				};
+				let Some(event_index) = row.start_event_index else {
+					app.status = "Selected interval has no editable session note".to_string();
+					return false;
+				};
+
+				let existing_note = match ledger.events.get(event_index).map(|event| &event.kind) {
+					Some(EventKind::Start { note, .. }) => note.clone().unwrap_or_default(),
+					_ => {
+						app.status = "Selected interval start event mismatch".to_string();
+						return false;
+					}
+				};
+
+				let mut prompt = PromptState::new(
+					"Session note (optional)",
+					PromptKind::EditStartNote {
+						event_index,
+						task_title: row.task_title.clone(),
+					},
+				);
+				prompt.input = existing_note;
+				app.mode = InputMode::Prompt(prompt);
+			} else if let Some(task_id) = app.selected_task_id(view) {
 				app.mode = InputMode::Prompt(PromptState::new(
-					"Start note (optional)",
+					"Session note (optional)",
 					PromptKind::StartTaskNote { task_id },
 				));
 			} else {
 				app.status = "Select a task first".to_string();
-			}
-			false
-		}
-		KeyCode::Char('x') => {
-			if let Some(task_id) = app.selected_active_task_id(view, snapshot) {
-				app.mode = InputMode::Prompt(PromptState::new(
-					"Stop note (optional)",
-					PromptKind::StopTaskNote { task_id },
-				));
-			} else {
-				app.status = "Select a running task to stop".to_string();
 			}
 			false
 		}
@@ -822,11 +871,11 @@ fn sorted_task_events(ledger: &Ledger, task_id: &str) -> Vec<TaskEventRef> {
 
 fn handle_prompt_key(
 	app: &mut App,
-	code: KeyCode,
+	key: KeyEvent,
 	ledger: &mut Ledger,
 	ledger_path: &mut PathBuf,
 ) -> bool {
-	match code {
+	match key.code {
 		KeyCode::Esc => {
 			app.mode = InputMode::Normal;
 			app.status = "Input cancelled".to_string();
@@ -836,34 +885,46 @@ fn handle_prompt_key(
 				prompt.input.pop();
 			}
 		}
+		KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+			if let InputMode::Prompt(prompt) = &mut app.mode {
+				prompt.input.push('\n');
+			}
+		}
+		KeyCode::Char('\n') | KeyCode::Char('\r') => {
+			submit_active_prompt(app, ledger, ledger_path.as_path());
+		}
 		KeyCode::Char(value) => {
 			if let InputMode::Prompt(prompt) = &mut app.mode {
 				prompt.input.push(value);
 			}
 		}
 		KeyCode::Enter => {
-			let prompt = match std::mem::replace(&mut app.mode, InputMode::Normal) {
-				InputMode::Prompt(prompt) => prompt,
-				InputMode::Normal | InputMode::Select(_) => return false,
-			};
-
-			match submit_prompt(prompt.clone(), ledger, ledger_path.as_path()) {
-				Ok(PromptOutcome::NextPrompt(next_prompt)) => app.mode = InputMode::Prompt(next_prompt),
-				Ok(PromptOutcome::Select(select)) => app.mode = InputMode::Select(select),
-				Ok(PromptOutcome::Done(message)) => {
-					app.mode = InputMode::Normal;
-					app.status = message;
-				}
-				Err(err) => {
-					app.mode = InputMode::Prompt(prompt);
-					app.status = format!("error: {err}");
-				}
-			}
+			submit_active_prompt(app, ledger, ledger_path.as_path());
 		}
 		_ => {}
 	}
 
 	false
+}
+
+fn submit_active_prompt(app: &mut App, ledger: &mut Ledger, ledger_path: &Path) {
+	let prompt = match std::mem::replace(&mut app.mode, InputMode::Normal) {
+		InputMode::Prompt(prompt) => prompt,
+		InputMode::Normal | InputMode::Select(_) => return,
+	};
+
+	match submit_prompt(prompt.clone(), ledger, ledger_path) {
+		Ok(PromptOutcome::NextPrompt(next_prompt)) => app.mode = InputMode::Prompt(next_prompt),
+		Ok(PromptOutcome::Select(select)) => app.mode = InputMode::Select(select),
+		Ok(PromptOutcome::Done(message)) => {
+			app.mode = InputMode::Normal;
+			app.status = message;
+		}
+		Err(err) => {
+			app.mode = InputMode::Prompt(prompt);
+			app.status = format!("error: {err}");
+		}
+	}
 }
 
 fn handle_select_key(
@@ -950,9 +1011,24 @@ fn submit_prompt(
 			let note = optional_text(&prompt.input);
 			start_task(ledger, ledger_path, &task_id, note).map(PromptOutcome::Done)
 		}
-		PromptKind::StopTaskNote { task_id } => {
+		PromptKind::EditStartNote {
+			event_index,
+			task_title,
+		} => {
 			let note = optional_text(&prompt.input);
-			stop_task(ledger, ledger_path, &task_id, note).map(PromptOutcome::Done)
+			let Some(event) = ledger.events.get_mut(event_index) else {
+				return Err("start event no longer exists".to_string());
+			};
+			match &mut event.kind {
+				EventKind::Start { note: current_note, .. } => {
+					*current_note = note;
+				}
+				EventKind::Stop { .. } => {
+					return Err("selected event is not a start event".to_string());
+				}
+			}
+			persist(ledger_path, ledger)?;
+			Ok(PromptOutcome::Done(format!("updated session note: {task_title}")))
 		}
 	}
 }
@@ -1884,8 +1960,9 @@ enum PromptKind {
 	StartTaskNote {
 		task_id: String,
 	},
-	StopTaskNote {
-		task_id: String,
+	EditStartNote {
+		event_index: usize,
+		task_title: String,
 	},
 }
 
@@ -2051,15 +2128,6 @@ impl App {
 				Some(ExplorerRowKind::Task { task_id, .. }) => Some(task_id),
 				_ => None,
 			},
-		}
-	}
-
-	fn selected_active_task_id(&self, view: &ViewModel, snapshot: &LedgerSnapshot) -> Option<String> {
-		let task_id = self.selected_task_id(view)?;
-		if snapshot.active_tasks.contains_key(&task_id) {
-			Some(task_id)
-		} else {
-			None
 		}
 	}
 
