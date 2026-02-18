@@ -1492,7 +1492,7 @@ fn build_explorer_rows(
 	app: &App,
 	ledger: &Ledger,
 	snapshot: &LedgerSnapshot,
-	week_stats: &WeekStatsView,
+	_week_stats: &WeekStatsView,
 ) -> Vec<ExplorerRow> {
 	match &app.explorer_mode {
 		ExplorerMode::Projects => {
@@ -1511,23 +1511,9 @@ fn build_explorer_rows(
 			projects
 				.into_iter()
 				.map(|project| {
-					let task_count = ledger
-						.header
-						.tasks
-						.iter()
-						.filter(|task| !task.archived && task.project_id == project.id)
-						.count();
-					let week_total = week_stats
-						.project_totals
-						.get(&project.id)
-						.copied()
-						.unwrap_or_else(Duration::zero);
 					let style = style_from_project_color(project.color.as_deref());
 					ExplorerRow {
-						line: Line::from(vec![
-							Span::styled(project.name.clone(), style),
-							Span::raw(format!(" | tasks {} | week {}", task_count, format_duration(week_total))),
-						]),
+						line: Line::from(Span::styled(project.name.clone(), style)),
 						kind: ExplorerRowKind::Project {
 							project_id: project.id.clone(),
 							project_name: project.name.clone(),
