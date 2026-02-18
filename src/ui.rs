@@ -295,7 +295,12 @@ fn render_week_stats_panel(frame: &mut Frame, area: Rect, view: &ViewModel) {
 		}
 	}
 
-	let panel = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Week Stats"));
+	let panel = Paragraph::new(lines).block(
+		Block::default()
+			.borders(Borders::ALL)
+			.title("Week Stats")
+			.border_style(Style::default().fg(INACTIVE_PANEL_BORDER_COLOR)),
+	);
 	frame.render_widget(panel, area);
 }
 
@@ -336,7 +341,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 		],
 	};
 
-	let footer = Paragraph::new(footer_lines).block(Block::default().borders(Borders::ALL).title("Shortcuts"));
+	let footer = Paragraph::new(footer_lines).block(
+		Block::default()
+			.borders(Borders::ALL)
+			.title("Shortcuts")
+			.border_style(Style::default().fg(INACTIVE_PANEL_BORDER_COLOR)),
+	);
 	frame.render_widget(footer, area);
 }
 
