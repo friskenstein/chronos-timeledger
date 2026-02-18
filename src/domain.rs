@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
@@ -232,27 +232,21 @@ impl Ledger {
 		events.sort_by_key(|event| event.timestamp);
 
 		let mut active_tasks: HashMap<String, ActiveSession> = HashMap::new();
-		let mut task_totals: HashMap<String, Duration> = HashMap::new();
 		let mut daily_task_totals: BTreeMap<NaiveDate, HashMap<String, Duration>> = BTreeMap::new();
-		let mut recency_order: Vec<String> = Vec::new();
 
 		for event in events {
 			match event.kind {
-				EventKind::Start { task_id, note } => {
-					recency_order.push(task_id.clone());
+				EventKind::Start { task_id, .. } => {
 					active_tasks.insert(
 						task_id,
 						ActiveSession {
 							started_at: event.timestamp,
-							note,
 						},
 					);
 				}
 				EventKind::Stop { task_id, .. } => {
-					recency_order.push(task_id.clone());
 					if let Some(active_session) = active_tasks.remove(&task_id) {
 						accumulate_session(
-							&mut task_totals,
 							&mut daily_task_totals,
 							&task_id,
 							active_session.started_at,
@@ -265,7 +259,6 @@ impl Ledger {
 
 		for (task_id, active_session) in &active_tasks {
 			accumulate_session(
-				&mut task_totals,
 				&mut daily_task_totals,
 				task_id,
 				active_session.started_at,
@@ -273,22 +266,9 @@ impl Ledger {
 			);
 		}
 
-		let mut seen = HashSet::new();
-		let mut recent_tasks = Vec::new();
-		for task_id in recency_order.into_iter().rev() {
-			if seen.insert(task_id.clone()) {
-				recent_tasks.push(task_id);
-				if recent_tasks.len() >= 20 {
-					break;
-				}
-			}
-		}
-
 		LedgerSnapshot {
 			active_tasks,
-			task_totals,
 			daily_task_totals,
-			recent_tasks,
 		}
 	}
 }
@@ -296,31 +276,15 @@ impl Ledger {
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
 	pub started_at: DateTime<Utc>,
-	pub note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct LedgerSnapshot {
 	pub active_tasks: HashMap<String, ActiveSession>,
-	pub task_totals: HashMap<String, Duration>,
 	pub daily_task_totals: BTreeMap<NaiveDate, HashMap<String, Duration>>,
-	pub recent_tasks: Vec<String>,
 }
 
 impl LedgerSnapshot {
-	pub fn total_tracked(&self) -> Duration {
-		self.task_totals
-			.values()
-			.fold(Duration::zero(), |acc, value| acc + *value)
-	}
-
-	pub fn total_for_day(&self, day: NaiveDate, task_id: &str) -> Duration {
-		self.daily_task_totals
-			.get(&day)
-			.and_then(|entries| entries.get(task_id).copied())
-			.unwrap_or_else(Duration::zero)
-	}
-
 	pub fn totals_for_day(&self, day: NaiveDate) -> Vec<(String, Duration)> {
 		let mut totals = self
 			.daily_task_totals
@@ -336,7 +300,6 @@ impl LedgerSnapshot {
 }
 
 fn accumulate_session(
-	task_totals: &mut HashMap<String, Duration>,
 	daily_task_totals: &mut BTreeMap<NaiveDate, HashMap<String, Duration>>,
 	task_id: &str,
 	start: DateTime<Utc>,
@@ -345,11 +308,6 @@ fn accumulate_session(
 	if stop <= start {
 		return;
 	}
-
-	let delta = stop - start;
-	*task_totals
-		.entry(task_id.to_string())
-		.or_insert_with(Duration::zero) += delta;
 
 	let mut cursor = start;
 	while cursor.date_naive() < stop.date_naive() {
@@ -428,12 +386,23 @@ mod tests {
 			.expect("stop should work");
 
 		let snapshot = ledger.snapshot(Utc.with_ymd_and_hms(2026, 1, 1, 10, 30, 0).unwrap());
+		let day = Utc.with_ymd_and_hms(2026, 1, 1, 10, 30, 0)
+			.unwrap()
+			.date_naive();
+		let task_totals = snapshot.totals_for_day(day);
+		let total_for = |task_id: &str| {
+			task_totals
+				.iter()
+				.find(|(id, _)| id == task_id)
+				.map(|(_, duration)| *duration)
+				.expect("task total")
+		};
 		assert_eq!(
-			format_duration(*snapshot.task_totals.get(&task_a).expect("task a total")),
+			format_duration(total_for(&task_a)),
 			"01:00:00"
 		);
 		assert_eq!(
-			format_duration(*snapshot.task_totals.get(&task_b).expect("task b total")),
+			format_duration(total_for(&task_b)),
 			"01:00:00"
 		);
 	}
