@@ -210,16 +210,21 @@ fn render_explorer_panel(frame: &mut Frame, area: Rect, app: &App, view: &ViewMo
 
 fn render_selected_day_panel(frame: &mut Frame, area: Rect, app: &App, view: &ViewModel) {
 	let mut items = Vec::new();
-	let mut previous_task_id: Option<&str> = None;
+	let mut previous_project_id: Option<&str> = None;
+	let mut previous_task_title: Option<&str> = None;
 	for (index, row) in view.day_rows.iter().enumerate() {
-		let suppress_header = previous_task_id == Some(row.task_id.as_str());
+		let show_project_header = previous_project_id != Some(row.project_id.as_str());
+		let show_task_label =
+			show_project_header || previous_task_title != Some(row.task_title.as_str());
 		items.push(render_day_row_item(
 			row,
-			suppress_header,
+			show_project_header,
+			show_task_label,
 			app.day_field,
 			index == app.day_index,
 		));
-		previous_task_id = Some(row.task_id.as_str());
+		previous_project_id = Some(row.project_id.as_str());
+		previous_task_title = Some(row.task_title.as_str());
 	}
 
 	if items.is_empty() {
@@ -352,7 +357,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_day_row_item(
 	row: &DaySessionRow,
-	suppress_header: bool,
+	show_project_header: bool,
+	show_task_label: bool,
 	selected_field: DayField,
 	is_selected: bool,
 ) -> ListItem<'static> {
@@ -381,19 +387,23 @@ fn render_day_row_item(
 		Span::raw(format!(" {}", format_duration(row.display_stop - row.display_start))),
 	];
 
+	if show_task_label {
+		timing_spans.push(Span::raw(format!(" {}", row.task_title)));
+	}
+
 	if let Some(note) = &row.note {
-		timing_spans.push(Span::raw(format!(" {note}")));
+		timing_spans.push(Span::styled(
+			format!(" {note}"),
+			Style::default().fg(Color::DarkGray),
+		));
 	}
 
 	let time_line = Line::from(timing_spans);
-	if suppress_header {
-		ListItem::new(vec![time_line])
-	} else {
-		let header_line = Line::from(vec![
-			Span::styled(row.project_name.clone(), row.project_style),
-			Span::raw(format!(" | {}", row.task_title)),
-		]);
+	if show_project_header {
+		let header_line = Line::from(vec![Span::styled(row.project_name.clone(), row.project_style)]);
 		ListItem::new(vec![header_line, time_line])
+	} else {
+		ListItem::new(vec![time_line])
 	}
 }
 
@@ -1346,11 +1356,12 @@ fn build_day_rows(selected_day: NaiveDate, ledger: &Ledger, sessions: &[SessionR
 				return None;
 			}
 
-			let (project_name, task_title) = task_project_and_title(ledger, &session.task_id);
+			let (project_id, project_name, task_title) = task_project_and_title(ledger, &session.task_id);
 			let project_style = task_style_for_id(ledger, &session.task_id);
 
 			Some(DaySessionRow {
 				task_id: session.task_id.clone(),
+				project_id,
 				project_name,
 				task_title,
 				project_style,
@@ -1727,16 +1738,20 @@ fn task_label(ledger: &Ledger, task_id: &str) -> String {
 		.unwrap_or_else(|| "Unknown task".to_string())
 }
 
-fn task_project_and_title(ledger: &Ledger, task_id: &str) -> (String, String) {
+fn task_project_and_title(ledger: &Ledger, task_id: &str) -> (String, String, String) {
 	if let Some(task) = ledger.task(task_id) {
 		let project = ledger
 			.project(&task.project_id)
 			.map(|project| project.name.clone())
 			.unwrap_or_else(|| "Unknown project".to_string());
-		return (project, task.short_description());
+		return (task.project_id.clone(), project, task.short_description());
 	}
 
-	("Unknown project".to_string(), "Unknown task".to_string())
+	(
+		"unknown".to_string(),
+		"Unknown project".to_string(),
+		"Unknown task".to_string(),
+	)
 }
 
 fn task_style_for_id(ledger: &Ledger, task_id: &str) -> Style {
@@ -2178,6 +2193,7 @@ struct ViewModel {
 #[derive(Clone)]
 struct DaySessionRow {
 	task_id: String,
+	project_id: String,
 	project_name: String,
 	task_title: String,
 	project_style: Style,
