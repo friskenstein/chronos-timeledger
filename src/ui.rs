@@ -124,8 +124,21 @@ fn draw_dashboard(frame: &mut Frame, app: &App, view: &ViewModel) {
 
     render_calendar_panel(frame, left[0], app, &view.calendar_active_days);
     render_explorer_panel(frame, left[1], app, view);
-    render_selected_day_panel(frame, body[1], app, view);
     render_week_stats_panel(frame, body[2], view);
+
+    if view.running_rows.is_empty() {
+        render_selected_day_panel(frame, body[1], app, view);
+    } else {
+        let center_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(8),
+                Constraint::Length(running_panel_height(view.running_rows.len())),
+            ])
+            .split(body[1]);
+        render_selected_day_panel(frame, center_layout[0], app, view);
+        render_running_panel(frame, center_layout[1], app, view);
+    }
     render_footer(frame, layout[1], app);
 
     match &app.mode {
@@ -279,6 +292,40 @@ fn render_selected_day_panel(frame: &mut Frame, area: Rect, app: &App, view: &Vi
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+fn render_running_panel(frame: &mut Frame, area: Rect, app: &App, view: &ViewModel) {
+    let items = if view.running_rows.is_empty() {
+        vec![ListItem::new("(no running tasks)")]
+    } else {
+        view.running_rows
+            .iter()
+            .map(render_running_row_item)
+            .collect::<Vec<_>>()
+    };
+
+    let mut state = ListState::default();
+    if !view.running_rows.is_empty() {
+        state.select(Some(
+            app.running_index.min(view.running_rows.len().saturating_sub(1)),
+        ));
+    }
+
+    let title = format!("Running Tasks ({})", view.running_rows.len());
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(border_style(app.focus == FocusPane::Running)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(HIGHLIGHT_BACKGROUND_COLOR)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 fn render_week_stats_panel(frame: &mut Frame, area: Rect, view: &ViewModel) {
     let week = &view.week_stats;
     let mut lines = Vec::new();
@@ -368,6 +415,11 @@ fn render_week_stats_panel(frame: &mut Frame, area: Rect, view: &ViewModel) {
             .border_style(Style::default().fg(INACTIVE_PANEL_BORDER_COLOR)),
     );
     frame.render_widget(panel, area);
+}
+
+fn running_panel_height(row_count: usize) -> u16 {
+    let rows = row_count.min(4).max(1) as u16;
+    rows + 2
 }
 
 fn bar_width_for_duration(duration: Duration, max_seconds: i64, max_width: usize) -> usize {
@@ -501,7 +553,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         InputMode::Normal => vec![
             Line::from("Tab pane | arrows/hjkl navigate | Enter open/collapse (explorer) | q quit"),
             Line::from(
-                "space start/stop (day+explorer) | d delete interval(day) | o new task | p project | c category | t task | e edit | s session note | g switch ledger",
+                "space start/stop (day+running+explorer) | d delete interval(day) | o new task | p project | c category | t task | e edit | s session note | g switch ledger",
             ),
             Line::from(format!(
                 "{}{}",
@@ -622,6 +674,33 @@ fn render_day_row_item(
     } else {
         ListItem::new(vec![time_line])
     }
+}
+
+fn render_running_row_item(row: &RunningTaskRow) -> ListItem<'static> {
+    let started_text = row
+        .started_at
+        .with_timezone(&Local)
+        .format("%H:%M")
+        .to_string();
+    let elapsed_text = format_duration(row.elapsed);
+    let mut spans = vec![
+        Span::styled("\u{f04b} ", Style::default().fg(Color::LightGreen)),
+        Span::raw(format!("{started_text} ")),
+        Span::styled(
+            format!("{elapsed_text} "),
+            Style::default().fg(Color::LightYellow),
+        ),
+        Span::raw(row.task_title.clone()),
+        Span::raw(" · "),
+        Span::styled(row.project_name.clone(), row.project_style),
+    ];
+    if let Some(note) = &row.note {
+        spans.push(Span::styled(
+            format!(" {note}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    ListItem::new(Line::from(spans))
 }
 
 fn render_select_popup(frame: &mut Frame, select: &SelectState) {
@@ -804,12 +883,16 @@ fn handle_normal_key(
             true
         }
         KeyCode::Tab => {
-            app.focus = app.focus.next();
+            app.focus = app
+                .focus
+                .next(!view.running_rows.is_empty());
             app.clear_day_edit_buffer();
             false
         }
         KeyCode::BackTab => {
-            app.focus = app.focus.prev();
+            app.focus = app
+                .focus
+                .prev(!view.running_rows.is_empty());
             app.clear_day_edit_buffer();
             false
         }
@@ -817,6 +900,7 @@ fn handle_normal_key(
             match app.focus {
                 FocusPane::Calendar => app.shift_selected_day(-7),
                 FocusPane::Day => app.move_day_selection(-1, view),
+                FocusPane::Running => app.move_running_selection(-1, view),
                 FocusPane::Explorer => app.move_explorer_selection(-1, view),
             }
             false
@@ -825,6 +909,7 @@ fn handle_normal_key(
             match app.focus {
                 FocusPane::Calendar => app.shift_selected_day(7),
                 FocusPane::Day => app.move_day_selection(1, view),
+                FocusPane::Running => app.move_running_selection(1, view),
                 FocusPane::Explorer => app.move_explorer_selection(1, view),
             }
             false
@@ -836,6 +921,7 @@ fn handle_normal_key(
                     app.day_field = DayField::Start;
                     app.clear_day_edit_buffer();
                 }
+                FocusPane::Running => {}
                 FocusPane::Explorer => {}
             }
             false
@@ -847,6 +933,7 @@ fn handle_normal_key(
                     app.day_field = DayField::End;
                     app.clear_day_edit_buffer();
                 }
+                FocusPane::Running => {}
                 FocusPane::Explorer => {}
             }
             false
@@ -915,41 +1002,55 @@ fn handle_normal_key(
             false
         }
         KeyCode::Char('s') => {
-            if app.focus == FocusPane::Day {
-                let Some(row) = view.day_rows.get(app.day_index) else {
-                    app.status = "No selected interval in day view".to_string();
-                    return false;
-                };
-                let Some(event_index) = row.start_event_index else {
-                    app.status = "Selected interval has no editable session note".to_string();
-                    return false;
-                };
-
-                let existing_note = match ledger.events.get(event_index).map(|event| &event.kind) {
-                    Some(EventKind::Start { note, .. }) => note.clone().unwrap_or_default(),
-                    _ => {
-                        app.status = "Selected interval start event mismatch".to_string();
+            match app.focus {
+                FocusPane::Day => {
+                    let Some(row) = view.day_rows.get(app.day_index) else {
+                        app.status = "No selected interval in day view".to_string();
                         return false;
-                    }
-                };
+                    };
+                    let Some(event_index) = row.start_event_index else {
+                        app.status = "Selected interval has no editable session note".to_string();
+                        return false;
+                    };
 
-                let mut prompt = PromptState::new(
-                    "Session note (optional)",
-                    PromptKind::EditStartNote {
+                    if let Err(err) = open_start_note_prompt(
+                        app,
+                        ledger,
                         event_index,
-                        task_title: row.task_title.clone(),
-                    },
-                );
-                prompt.input = existing_note;
-                prompt.cursor = prompt.input.len();
-                app.mode = InputMode::Prompt(prompt);
-            } else if let Some(task_id) = app.selected_task_id(view) {
-                app.mode = InputMode::Prompt(PromptState::new(
-                    "Session note (optional)",
-                    PromptKind::StartTaskNote { task_id },
-                ));
-            } else {
-                app.status = "Select a task first".to_string();
+                        row.task_title.clone(),
+                    ) {
+                        app.status = err;
+                    }
+                }
+                FocusPane::Running => {
+                    let Some(row) = view.running_rows.get(app.running_index) else {
+                        app.status = "No selected running task".to_string();
+                        return false;
+                    };
+                    let Some(event_index) = row.start_event_index else {
+                        app.status = "Selected interval has no editable session note".to_string();
+                        return false;
+                    };
+
+                    if let Err(err) = open_start_note_prompt(
+                        app,
+                        ledger,
+                        event_index,
+                        row.task_title.clone(),
+                    ) {
+                        app.status = err;
+                    }
+                }
+                _ => {
+                    if let Some(task_id) = app.selected_task_id(view) {
+                        app.mode = InputMode::Prompt(PromptState::new(
+                            "Session note (optional)",
+                            PromptKind::StartTaskNote { task_id },
+                        ));
+                    } else {
+                        app.status = "Select a task first".to_string();
+                    }
+                }
             }
             false
         }
@@ -1026,6 +1127,32 @@ fn handle_normal_key(
         }
         _ => false,
     }
+}
+
+fn open_start_note_prompt(
+    app: &mut App,
+    ledger: &Ledger,
+    event_index: usize,
+    task_title: String,
+) -> Result<(), String> {
+    let existing_note = match ledger.events.get(event_index).map(|event| &event.kind) {
+        Some(EventKind::Start { note, .. }) => note.clone().unwrap_or_default(),
+        _ => {
+            return Err("Selected interval start event mismatch".to_string());
+        }
+    };
+
+    let mut prompt = PromptState::new(
+        "Session note (optional)",
+        PromptKind::EditStartNote {
+            event_index,
+            task_title,
+        },
+    );
+    prompt.input = existing_note;
+    prompt.cursor = prompt.input.len();
+    app.mode = InputMode::Prompt(prompt);
+    Ok(())
 }
 
 fn handle_day_digit_input(
@@ -2040,6 +2167,7 @@ fn build_view(
     let daily_task_totals = build_local_daily_task_totals(&sessions);
     let calendar_active_days = daily_task_totals.keys().copied().collect::<HashSet<_>>();
     let (day_rows, day_total) = build_day_rows(app.selected_day, ledger, &sessions);
+    let running_rows = build_running_rows(ledger, &sessions, now);
     let week_stats = build_week_stats(app.selected_day, ledger, &daily_task_totals);
     let explorer_rows = build_explorer_rows(app, ledger, snapshot, &week_stats);
 
@@ -2047,6 +2175,7 @@ fn build_view(
         calendar_active_days,
         day_rows,
         day_total,
+        running_rows,
         week_stats,
         explorer_rows,
     }
@@ -2174,6 +2303,40 @@ fn build_day_rows(
     });
 
     (rows, day_total)
+}
+
+fn build_running_rows(
+    ledger: &Ledger,
+    sessions: &[SessionRecord],
+    now: DateTime<Utc>,
+) -> Vec<RunningTaskRow> {
+    let mut rows = sessions
+        .iter()
+        .filter(|session| session.stop_event_index.is_none())
+        .map(|session| {
+            let (_, project_name, task_title) = task_project_and_title(ledger, &session.task_id);
+            let project_style = task_style_for_id(ledger, &session.task_id);
+            let elapsed = now - session.start;
+            RunningTaskRow {
+                task_id: session.task_id.clone(),
+                project_name,
+                task_title,
+                project_style,
+                started_at: session.start,
+                elapsed,
+                note: session.note.clone(),
+                start_event_index: session.start_event_index,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    rows.sort_by(|left, right| {
+        left.started_at
+            .cmp(&right.started_at)
+            .then_with(|| left.task_title.cmp(&right.task_title))
+    });
+
+    rows
 }
 
 fn build_local_daily_task_totals(
@@ -3363,23 +3526,38 @@ enum SelectKind {
 enum FocusPane {
     Calendar,
     Day,
+    Running,
     Explorer,
 }
 
 impl FocusPane {
-    fn next(self) -> Self {
+    fn next(self, running_visible: bool) -> Self {
         match self {
             FocusPane::Calendar => FocusPane::Day,
-            FocusPane::Day => FocusPane::Explorer,
+            FocusPane::Day => {
+                if running_visible {
+                    FocusPane::Running
+                } else {
+                    FocusPane::Explorer
+                }
+            }
+            FocusPane::Running => FocusPane::Explorer,
             FocusPane::Explorer => FocusPane::Calendar,
         }
     }
 
-    fn prev(self) -> Self {
+    fn prev(self, running_visible: bool) -> Self {
         match self {
             FocusPane::Calendar => FocusPane::Explorer,
             FocusPane::Day => FocusPane::Calendar,
-            FocusPane::Explorer => FocusPane::Day,
+            FocusPane::Running => FocusPane::Day,
+            FocusPane::Explorer => {
+                if running_visible {
+                    FocusPane::Running
+                } else {
+                    FocusPane::Day
+                }
+            }
         }
     }
 }
@@ -3416,6 +3594,7 @@ struct App {
     day_index: usize,
     day_field: DayField,
     day_edit_buffer: String,
+    running_index: usize,
     explorer_mode: ExplorerMode,
     explorer_index: usize,
     explorer_collapsed_categories: HashSet<String>,
@@ -3433,6 +3612,7 @@ impl Default for App {
             day_index: 0,
             day_field: DayField::Start,
             day_edit_buffer: String::new(),
+            running_index: 0,
             explorer_mode: ExplorerMode::Projects,
             explorer_index: 0,
             explorer_collapsed_categories: HashSet::new(),
@@ -3448,6 +3628,17 @@ impl App {
             self.day_index = 0;
         } else {
             self.day_index = self.day_index.min(view.day_rows.len() - 1);
+        }
+
+        if view.running_rows.is_empty() {
+            self.running_index = 0;
+            if self.focus == FocusPane::Running {
+                self.focus = FocusPane::Day;
+            }
+        } else {
+            self.running_index = self
+                .running_index
+                .min(view.running_rows.len().saturating_sub(1));
         }
 
         if view.explorer_rows.is_empty() {
@@ -3501,12 +3692,32 @@ impl App {
         }
     }
 
+    fn move_running_selection(&mut self, delta: i32, view: &ViewModel) {
+        if view.running_rows.is_empty() {
+            self.running_index = 0;
+            return;
+        }
+
+        if delta > 0 {
+            self.running_index =
+                (self.running_index + delta as usize).min(view.running_rows.len() - 1);
+        } else {
+            self.running_index = self
+                .running_index
+                .saturating_sub(delta.unsigned_abs() as usize);
+        }
+    }
+
     fn selected_task_id(&self, view: &ViewModel) -> Option<String> {
         match self.focus {
             FocusPane::Calendar => None,
             FocusPane::Day => view
                 .day_rows
                 .get(self.day_index)
+                .map(|row| row.task_id.clone()),
+            FocusPane::Running => view
+                .running_rows
+                .get(self.running_index)
                 .map(|row| row.task_id.clone()),
             FocusPane::Explorer => match self.selected_explorer_row_kind(view) {
                 Some(ExplorerRowKind::Task { task_id, .. }) => Some(task_id),
@@ -3559,6 +3770,7 @@ struct ViewModel {
     calendar_active_days: HashSet<NaiveDate>,
     day_rows: Vec<DaySessionRow>,
     day_total: Duration,
+    running_rows: Vec<RunningTaskRow>,
     week_stats: WeekStatsView,
     explorer_rows: Vec<ExplorerRow>,
 }
@@ -3577,6 +3789,18 @@ struct DaySessionRow {
     display_stop: DateTime<Utc>,
     start_event_index: Option<usize>,
     stop_event_index: Option<usize>,
+}
+
+#[derive(Clone)]
+struct RunningTaskRow {
+    task_id: String,
+    project_name: String,
+    task_title: String,
+    project_style: Style,
+    started_at: DateTime<Utc>,
+    elapsed: Duration,
+    note: Option<String>,
+    start_event_index: Option<usize>,
 }
 
 #[derive(Clone)]
