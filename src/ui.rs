@@ -2166,7 +2166,7 @@ fn build_view(
     let sessions = collect_sessions(ledger, now);
     let daily_task_totals = build_local_daily_task_totals(&sessions);
     let calendar_active_days = daily_task_totals.keys().copied().collect::<HashSet<_>>();
-    let (day_rows, day_total) = build_day_rows(app.selected_day, ledger, &sessions);
+    let day_rows = build_day_rows(app.selected_day, ledger, &sessions);
     let running_rows = build_running_rows(ledger, &sessions, now);
     let week_stats = build_week_stats(app.selected_day, ledger, &daily_task_totals);
     let explorer_rows = build_explorer_rows(app, ledger, snapshot, &week_stats);
@@ -2174,7 +2174,6 @@ fn build_view(
     ViewModel {
         calendar_active_days,
         day_rows,
-        day_total,
         running_rows,
         week_stats,
         explorer_rows,
@@ -2246,7 +2245,7 @@ fn build_day_rows(
     selected_day: NaiveDate,
     ledger: &Ledger,
     sessions: &[SessionRecord],
-) -> (Vec<DaySessionRow>, Duration) {
+) -> Vec<DaySessionRow> {
     let (day_start, day_end) = local_day_bounds_utc(selected_day);
 
     let mut rows = sessions
@@ -2298,11 +2297,7 @@ fn build_day_rows(
             .then_with(|| left.task_title.cmp(&right.task_title))
     });
 
-    let day_total = rows.iter().fold(Duration::zero(), |acc, row| {
-        acc + (row.display_stop - row.display_start)
-    });
-
-    (rows, day_total)
+    rows
 }
 
 fn build_running_rows(
@@ -2477,7 +2472,6 @@ fn build_week_stats(
         avg_per_day,
         max_day,
         active_days,
-        project_totals,
         top_projects,
         daily_project_mix,
     }
@@ -3769,7 +3763,6 @@ impl App {
 struct ViewModel {
     calendar_active_days: HashSet<NaiveDate>,
     day_rows: Vec<DaySessionRow>,
-    day_total: Duration,
     running_rows: Vec<RunningTaskRow>,
     week_stats: WeekStatsView,
     explorer_rows: Vec<ExplorerRow>,
@@ -3811,7 +3804,6 @@ struct WeekStatsView {
     avg_per_day: Duration,
     max_day: Duration,
     active_days: usize,
-    project_totals: HashMap<String, Duration>,
     top_projects: Vec<ProjectSummaryRow>,
     daily_project_mix: Vec<Vec<ProjectSummaryRow>>,
 }
