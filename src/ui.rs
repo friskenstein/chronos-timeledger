@@ -40,6 +40,8 @@ const TERMINAL_COLORS: [&str; 16] = [
 const FOCUSED_PANEL_BORDER_COLOR: Color = Color::Yellow;
 const INACTIVE_PANEL_BORDER_COLOR: Color = Color::DarkGray;
 const HIGHLIGHT_BACKGROUND_COLOR: Color = Color::Rgb(42, 45, 52);
+const COLOR_SWATCH: &str = "████████████████";
+const NO_COLOR_SWATCH: &str = "░░░░░░░░░░░░░░░░";
 
 pub fn run_dashboard(ledger: &mut Ledger, ledger_path: &mut PathBuf) -> Result<(), Box<dyn Error>> {
 	enable_raw_mode()?;
@@ -328,8 +330,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 		],
 		InputMode::Prompt(prompt) => vec![
 			Line::from(format!("Prompt: {}", prompt.title)),
-			Line::from("Enter confirm | Ctrl+J newline"),
-			Line::from("Esc cancel"),
+			Line::from("Arrows move cursor | Enter confirm"),
+			Line::from("Ctrl+J newline | Esc cancel"),
 		],
 		InputMode::Select(select) => vec![
 			Line::from(select.title.clone()),
@@ -475,13 +477,21 @@ fn render_prompt_popup(frame: &mut Frame, prompt: &PromptState) {
 		Style::default().fg(Color::DarkGray),
 	)));
 
-	let paragraph = Paragraph::new(lines).block(
-		Block::default()
-			.borders(Borders::ALL)
-			.title(prompt.title.clone())
-			.border_style(Style::default().fg(FOCUSED_PANEL_BORDER_COLOR).add_modifier(Modifier::BOLD)),
-	);
+	let block = Block::default()
+		.borders(Borders::ALL)
+		.title(prompt.title.clone())
+		.border_style(Style::default().fg(FOCUSED_PANEL_BORDER_COLOR).add_modifier(Modifier::BOLD));
+	let inner = block.inner(area);
+	let paragraph = Paragraph::new(lines).block(block);
 	frame.render_widget(paragraph, area);
+
+	let (line, col) = cursor_line_col(&prompt.input, prompt.cursor);
+	let max_x = inner.x.saturating_add(inner.width.saturating_sub(1));
+	let cursor_x = inner.x.saturating_add(col as u16).min(max_x);
+	let cursor_y = inner.y.saturating_add(line as u16);
+	if cursor_y < inner.y + inner.height {
+		frame.set_cursor_position((cursor_x, cursor_y));
+	}
 }
 
 fn render_edit_popup(frame: &mut Frame, edit: &EditState) {
@@ -504,8 +514,12 @@ fn render_edit_popup(frame: &mut Frame, edit: &EditState) {
 		.fields
 		.iter()
 		.map(|field| {
-			let value = edit_field_display_value(field);
-			ListItem::new(format!("{}: {}", field.label, value))
+			let (value, value_style) = edit_field_display(field);
+			let line = Line::from(vec![
+				Span::raw(format!("{}: ", field.label)),
+				Span::styled(value, value_style),
+			]);
+			ListItem::new(line)
 		})
 		.collect::<Vec<_>>();
 	let list = List::new(items)
@@ -520,6 +534,18 @@ fn render_edit_popup(frame: &mut Frame, edit: &EditState) {
 	let hint_lines = build_edit_hint_lines(edit);
 	let hint_panel = Paragraph::new(hint_lines);
 	frame.render_widget(hint_panel, content_layout[1]);
+
+	if edit.editing {
+		let (line, col) = cursor_line_col(&edit.input, edit.cursor);
+		let max_x = content_layout[1]
+			.x
+			.saturating_add(content_layout[1].width.saturating_sub(1));
+		let cursor_x = content_layout[1].x.saturating_add(col as u16).min(max_x);
+		let cursor_y = content_layout[1].y.saturating_add(1 + line as u16);
+		if cursor_y < content_layout[1].y + content_layout[1].height {
+			frame.set_cursor_position((cursor_x, cursor_y));
+		}
+	}
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -696,6 +722,7 @@ fn handle_normal_key(
 					},
 				);
 				prompt.input = existing_note;
+				prompt.cursor = prompt.input.len();
 				app.mode = InputMode::Prompt(prompt);
 			} else if let Some(task_id) = app.selected_task_id(view) {
 				app.mode = InputMode::Prompt(PromptState::new(
@@ -961,12 +988,47 @@ fn handle_prompt_key(
 		}
 		KeyCode::Backspace => {
 			if let InputMode::Prompt(prompt) = &mut app.mode {
-				prompt.input.pop();
+				remove_char_before_cursor(&mut prompt.input, &mut prompt.cursor);
+			}
+		}
+		KeyCode::Delete => {
+			if let InputMode::Prompt(prompt) = &mut app.mode {
+				remove_char_at_cursor(&mut prompt.input, &mut prompt.cursor);
+			}
+		}
+		KeyCode::Left => {
+			if let InputMode::Prompt(prompt) = &mut app.mode {
+				move_cursor_left(&prompt.input, &mut prompt.cursor);
+			}
+		}
+		KeyCode::Right => {
+			if let InputMode::Prompt(prompt) = &mut app.mode {
+				move_cursor_right(&prompt.input, &mut prompt.cursor);
+			}
+		}
+		KeyCode::Up => {
+			if let InputMode::Prompt(prompt) = &mut app.mode {
+				move_cursor_vertical(&prompt.input, &mut prompt.cursor, -1);
+			}
+		}
+		KeyCode::Down => {
+			if let InputMode::Prompt(prompt) = &mut app.mode {
+				move_cursor_vertical(&prompt.input, &mut prompt.cursor, 1);
+			}
+		}
+		KeyCode::Home => {
+			if let InputMode::Prompt(prompt) = &mut app.mode {
+				move_cursor_line_start(&prompt.input, &mut prompt.cursor);
+			}
+		}
+		KeyCode::End => {
+			if let InputMode::Prompt(prompt) = &mut app.mode {
+				move_cursor_line_end(&prompt.input, &mut prompt.cursor);
 			}
 		}
 		KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
 			if let InputMode::Prompt(prompt) = &mut app.mode {
-				prompt.input.push('\n');
+				insert_char_at_cursor(&mut prompt.input, &mut prompt.cursor, '\n');
 			}
 		}
 		KeyCode::Char('\n') | KeyCode::Char('\r') => {
@@ -974,7 +1036,7 @@ fn handle_prompt_key(
 		}
 		KeyCode::Char(value) => {
 			if let InputMode::Prompt(prompt) = &mut app.mode {
-				prompt.input.push(value);
+				insert_char_at_cursor(&mut prompt.input, &mut prompt.cursor, value);
 			}
 		}
 		KeyCode::Enter => {
@@ -1071,20 +1133,42 @@ fn handle_edit_key(
 				KeyCode::Esc => {
 					edit.editing = false;
 					edit.input.clear();
+					edit.cursor = 0;
 				}
 				KeyCode::Backspace => {
-					edit.input.pop();
+					remove_char_before_cursor(&mut edit.input, &mut edit.cursor);
+				}
+				KeyCode::Delete => {
+					remove_char_at_cursor(&mut edit.input, &mut edit.cursor);
+				}
+				KeyCode::Left => {
+					move_cursor_left(&edit.input, &mut edit.cursor);
+				}
+				KeyCode::Right => {
+					move_cursor_right(&edit.input, &mut edit.cursor);
+				}
+				KeyCode::Up => {
+					move_cursor_vertical(&edit.input, &mut edit.cursor, -1);
+				}
+				KeyCode::Down => {
+					move_cursor_vertical(&edit.input, &mut edit.cursor, 1);
+				}
+				KeyCode::Home => {
+					move_cursor_line_start(&edit.input, &mut edit.cursor);
+				}
+				KeyCode::End => {
+					move_cursor_line_end(&edit.input, &mut edit.cursor);
 				}
 				KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
 					if edit_selected_field_multiline(edit) {
-						edit.input.push('\n');
+						insert_char_at_cursor(&mut edit.input, &mut edit.cursor, '\n');
 					}
 				}
 				KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
 					commit_edit_field_input(edit);
 				}
 				KeyCode::Char(value) => {
-					edit.input.push(value);
+					insert_char_at_cursor(&mut edit.input, &mut edit.cursor, value);
 				}
 				_ => {}
 			}
@@ -1336,14 +1420,13 @@ fn submit_edit(edit: &EditState, ledger: &mut Ledger, ledger_path: &Path) -> Res
 
 fn build_project_color_select(name: String) -> SelectState {
 	let mut options = vec![SelectOption::new(
-		"No color",
+		NO_COLOR_SWATCH,
 		None,
-		Style::default().fg(Color::Gray),
+		Style::default().fg(Color::DarkGray),
 	)];
 	for color in TERMINAL_COLORS {
-		let swatch = "████████████████".to_string();
 		options.push(SelectOption::new(
-			swatch,
+			COLOR_SWATCH,
 			Some(color.to_string()),
 			color_block_style(color),
 		));
@@ -1627,9 +1710,9 @@ fn build_category_options(ledger: &Ledger, include_uncategorized: bool) -> Vec<E
 }
 
 fn build_color_options() -> Vec<EditOption> {
-	let mut options = vec![EditOption::new("No color", None)];
+	let mut options = vec![EditOption::new(NO_COLOR_SWATCH, None)];
 	for color in TERMINAL_COLORS {
-		options.push(EditOption::new(color.to_string(), Some(color.to_string())));
+		options.push(EditOption::new(COLOR_SWATCH, Some(color.to_string())));
 	}
 	options
 }
@@ -2110,7 +2193,181 @@ fn optional_text(input: &str) -> Option<String> {
 	}
 }
 
-fn edit_field_display_value(field: &EditField) -> String {
+fn insert_char_at_cursor(input: &mut String, cursor: &mut usize, value: char) {
+	let clamped = clamp_cursor(input, *cursor);
+	input.insert(clamped, value);
+	*cursor = clamped + value.len_utf8();
+}
+
+fn remove_char_before_cursor(input: &mut String, cursor: &mut usize) {
+	let clamped = clamp_cursor(input, *cursor);
+	if clamped == 0 {
+		*cursor = 0;
+		return;
+	}
+	let previous = previous_char_index(input, clamped);
+	input.replace_range(previous..clamped, "");
+	*cursor = previous;
+}
+
+fn remove_char_at_cursor(input: &mut String, cursor: &mut usize) {
+	let clamped = clamp_cursor(input, *cursor);
+	if clamped >= input.len() {
+		*cursor = input.len();
+		return;
+	}
+	let next = next_char_index(input, clamped);
+	input.replace_range(clamped..next, "");
+	*cursor = clamped;
+}
+
+fn move_cursor_left(input: &str, cursor: &mut usize) {
+	let clamped = clamp_cursor(input, *cursor);
+	*cursor = previous_char_index(input, clamped);
+}
+
+fn move_cursor_right(input: &str, cursor: &mut usize) {
+	let clamped = clamp_cursor(input, *cursor);
+	*cursor = next_char_index(input, clamped);
+}
+
+fn move_cursor_vertical(input: &str, cursor: &mut usize, delta: i32) {
+	let clamped = clamp_cursor(input, *cursor);
+	let line_ranges = line_ranges(input);
+	let (line, col) = cursor_line_col_with_ranges(input, clamped, &line_ranges);
+	if line_ranges.is_empty() {
+		return;
+	}
+	let mut next_line = line as i32 + delta;
+	next_line = next_line.clamp(0, line_ranges.len().saturating_sub(1) as i32);
+	let target = cursor_from_line_col_with_ranges(input, next_line as usize, col, &line_ranges);
+	*cursor = target;
+}
+
+fn move_cursor_line_start(input: &str, cursor: &mut usize) {
+	let clamped = clamp_cursor(input, *cursor);
+	let line_ranges = line_ranges(input);
+	let (line, _) = cursor_line_col_with_ranges(input, clamped, &line_ranges);
+	if let Some(range) = line_ranges.get(line) {
+		*cursor = range.start;
+	}
+}
+
+fn move_cursor_line_end(input: &str, cursor: &mut usize) {
+	let clamped = clamp_cursor(input, *cursor);
+	let line_ranges = line_ranges(input);
+	let (line, _) = cursor_line_col_with_ranges(input, clamped, &line_ranges);
+	if let Some(range) = line_ranges.get(line) {
+		*cursor = range.end;
+	}
+}
+
+fn clamp_cursor(input: &str, cursor: usize) -> usize {
+	let clamped = cursor.min(input.len());
+	if input.is_char_boundary(clamped) {
+		return clamped;
+	}
+	previous_char_index(input, clamped)
+}
+
+fn previous_char_index(input: &str, cursor: usize) -> usize {
+	let mut previous = 0;
+	for (index, _) in input.char_indices() {
+		if index >= cursor {
+			break;
+		}
+		previous = index;
+	}
+	previous
+}
+
+fn next_char_index(input: &str, cursor: usize) -> usize {
+	if cursor >= input.len() {
+		return input.len();
+	}
+	let mut iter = input[cursor..].char_indices();
+	iter.next();
+	if let Some((offset, _)) = iter.next() {
+		cursor + offset
+	} else {
+		input.len()
+	}
+}
+
+fn cursor_line_col(input: &str, cursor: usize) -> (usize, usize) {
+	let line_ranges = line_ranges(input);
+	cursor_line_col_with_ranges(input, clamp_cursor(input, cursor), &line_ranges)
+}
+
+fn cursor_line_col_with_ranges(input: &str, cursor: usize, line_ranges: &[LineRange]) -> (usize, usize) {
+	if line_ranges.is_empty() {
+		return (0, 0);
+	}
+	for (index, range) in line_ranges.iter().enumerate() {
+		if cursor <= range.end {
+			let col = input[range.start..cursor].chars().count();
+			return (index, col);
+		}
+	}
+	let last_index = line_ranges.len().saturating_sub(1);
+	let last = &line_ranges[last_index];
+	let col = input[last.start..last.end].chars().count();
+	(last_index, col)
+}
+
+fn cursor_from_line_col_with_ranges(
+	input: &str,
+	line_index: usize,
+	col: usize,
+	line_ranges: &[LineRange],
+) -> usize {
+	let Some(range) = line_ranges.get(line_index) else {
+		return input.len();
+	};
+	let slice = &input[range.start..range.end];
+	let mut count = 0usize;
+	for (offset, _) in slice.char_indices() {
+		if count == col {
+			return range.start + offset;
+		}
+		count += 1;
+	}
+	range.end
+}
+
+fn line_ranges(input: &str) -> Vec<LineRange> {
+	let mut ranges = Vec::new();
+	let mut start = 0usize;
+	for (index, ch) in input.char_indices() {
+		if ch == '\n' {
+			ranges.push(LineRange { start, end: index });
+			start = index + ch.len_utf8();
+		}
+	}
+	ranges.push(LineRange {
+		start,
+		end: input.len(),
+	});
+	ranges
+}
+
+fn color_swatch_label(color_name: Option<&str>) -> String {
+	if color_name.is_some() {
+		COLOR_SWATCH.to_string()
+	} else {
+		NO_COLOR_SWATCH.to_string()
+	}
+}
+
+fn color_swatch_style(color_name: Option<&str>) -> Style {
+	if let Some(name) = color_name {
+		style_from_project_color(Some(name))
+	} else {
+		Style::default().fg(Color::DarkGray)
+	}
+}
+
+fn edit_field_display(field: &EditField) -> (String, Style) {
 	match &field.kind {
 		EditFieldKind::Text {
 			value,
@@ -2120,30 +2377,39 @@ fn edit_field_display_value(field: &EditField) -> String {
 			let trimmed = value.trim_end_matches('\n');
 			if trimmed.is_empty() {
 				if *optional {
-					return "(none)".to_string();
+					return ("(none)".to_string(), Style::default());
 				}
-				return "(empty)".to_string();
+				return ("(empty)".to_string(), Style::default());
 			}
 			let mut lines = trimmed.lines();
 			let first = lines.next().unwrap_or("");
 			if lines.next().is_some() {
-				format!("{first}...")
+				(format!("{first}..."), Style::default())
 			} else {
-				first.to_string()
+				(first.to_string(), Style::default())
 			}
 		}
 		EditFieldKind::Bool { value } => {
 			if *value {
-				"Yes".to_string()
+				("Yes".to_string(), Style::default())
 			} else {
-				"No".to_string()
+				("No".to_string(), Style::default())
 			}
 		}
-		EditFieldKind::Choice { value, options } => options
-			.iter()
-			.find(|option| option.value == *value)
-			.map(|option| option.label.clone())
-			.unwrap_or_else(|| "(unknown)".to_string()),
+		EditFieldKind::Choice { value, options } => {
+			if field.id == EditFieldId::Color {
+				let swatch = color_swatch_label(value.as_deref());
+				let style = color_swatch_style(value.as_deref());
+				(swatch, style)
+			} else {
+				let label = options
+					.iter()
+					.find(|option| option.value == *value)
+					.map(|option| option.label.clone())
+					.unwrap_or_else(|| "(unknown)".to_string());
+				(label, Style::default())
+			}
+		}
 	}
 }
 
@@ -2170,7 +2436,11 @@ fn build_edit_hint_lines(edit: &EditState) -> Vec<Line<'static>> {
 
 		lines.push(Line::from(""));
 		lines.push(Line::from(Span::styled(
-			"Enter save field | Ctrl+J newline | Esc cancel",
+			"Arrows move cursor | Enter save field",
+			Style::default().fg(Color::DarkGray),
+		)));
+		lines.push(Line::from(Span::styled(
+			"Ctrl+J newline | Esc cancel",
 			Style::default().fg(Color::DarkGray),
 		)));
 	} else {
@@ -2190,6 +2460,7 @@ fn activate_edit_field(edit: &mut EditState) {
 		EditFieldKind::Text { value, .. } => {
 			edit.editing = true;
 			edit.input = value.clone();
+			edit.cursor = edit.input.len();
 		}
 		EditFieldKind::Bool { .. } | EditFieldKind::Choice { .. } => {
 			cycle_edit_field(edit, 1);
@@ -2231,6 +2502,7 @@ fn commit_edit_field_input(edit: &mut EditState) {
 	}
 	edit.editing = false;
 	edit.input.clear();
+	edit.cursor = 0;
 }
 
 fn edit_selected_field_multiline(edit: &EditState) -> bool {
@@ -2440,6 +2712,7 @@ enum SelectOutcome {
 struct PromptState {
 	title: String,
 	input: String,
+	cursor: usize,
 	kind: PromptKind,
 }
 
@@ -2448,6 +2721,7 @@ impl PromptState {
 		Self {
 			title: title.into(),
 			input: String::new(),
+			cursor: 0,
 			kind,
 		}
 	}
@@ -2610,6 +2884,7 @@ struct EditState {
 	selected: usize,
 	editing: bool,
 	input: String,
+	cursor: usize,
 }
 
 impl EditState {
@@ -2621,6 +2896,7 @@ impl EditState {
 			selected: 0,
 			editing: false,
 			input: String::new(),
+			cursor: 0,
 		}
 	}
 
@@ -2964,6 +3240,11 @@ struct TaskEventRef {
 	index: usize,
 	timestamp: DateTime<Utc>,
 	kind: TaskEventKind,
+}
+
+struct LineRange {
+	start: usize,
+	end: usize,
 }
 
 pub fn print_event_log(ledger: &Ledger, limit: usize) {
