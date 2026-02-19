@@ -296,23 +296,35 @@ fn render_week_stats_panel(frame: &mut Frame, area: Rect, view: &ViewModel) {
     lines.push(Line::from(""));
     lines.push(Line::from("Daily Activity"));
 
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let bar_indent = 0usize;
+    let bar_right_padding = inner_width > 0;
+    let bar_max_width = inner_width.saturating_sub(1);
     let max_seconds = week
         .daily
         .iter()
         .map(|(_, duration)| duration.num_seconds())
         .max()
-        .unwrap_or(0)
-        .max(1);
-    for (day, duration) in &week.daily {
-        let seconds = duration.num_seconds();
-        let width = ((seconds as f64 / max_seconds as f64) * 16.0).round() as usize;
-        let bar = "=".repeat(width.max(1));
+        .unwrap_or(0);
+    for (index, (day, duration)) in week.daily.iter().enumerate() {
         lines.push(Line::from(format!(
-            "{} {:>8} {}",
+            "{} {:>8}",
             day.format("%a"),
-            format_duration(*duration),
-            if seconds == 0 { "".to_string() } else { bar }
+            format_duration(*duration)
         )));
+        let bar_width = bar_width_for_duration(*duration, max_seconds, bar_max_width);
+        let day_mix = week
+            .daily_project_mix
+            .get(index)
+            .map(|mix| mix.as_slice())
+            .unwrap_or(&[]);
+        lines.push(build_mixed_bar_line(
+            bar_indent,
+            bar_width,
+            day_mix,
+            *duration,
+            bar_right_padding,
+        ));
     }
 
     lines.push(Line::from(""));
@@ -320,11 +332,25 @@ fn render_week_stats_panel(frame: &mut Frame, area: Rect, view: &ViewModel) {
     if week.top_projects.is_empty() {
         lines.push(Line::from("(none)"));
     } else {
+        let max_project_seconds = week
+            .top_projects
+            .iter()
+            .map(|project| project.duration.num_seconds())
+            .max()
+            .unwrap_or(0);
         for project in week.top_projects.iter().take(6) {
             lines.push(Line::from(vec![
                 Span::styled(project.name.clone(), project.style),
                 Span::raw(format!(" | {}", format_duration(project.duration))),
             ]));
+            let bar_width =
+                bar_width_for_duration(project.duration, max_project_seconds, bar_max_width);
+            lines.push(build_single_color_bar_line(
+                bar_indent,
+                bar_width,
+                project.style,
+                bar_right_padding,
+            ));
         }
     }
 
@@ -335,6 +361,132 @@ fn render_week_stats_panel(frame: &mut Frame, area: Rect, view: &ViewModel) {
             .border_style(Style::default().fg(INACTIVE_PANEL_BORDER_COLOR)),
     );
     frame.render_widget(panel, area);
+}
+
+fn bar_width_for_duration(duration: Duration, max_seconds: i64, max_width: usize) -> usize {
+    if max_width == 0 {
+        return 0;
+    }
+    let seconds = duration.num_seconds().max(0);
+    if seconds == 0 || max_seconds <= 0 {
+        return 0;
+    }
+    let scaled = seconds as i128 * max_width as i128;
+    let rounded = (scaled + (max_seconds as i128 / 2)) / max_seconds as i128;
+    let width = (rounded as usize).min(max_width);
+    if width == 0 { 1 } else { width }
+}
+
+fn build_mixed_bar_line(
+    bar_indent: usize,
+    bar_width: usize,
+    segments: &[ProjectSummaryRow],
+    total: Duration,
+    right_padding: bool,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    if bar_indent > 0 {
+        spans.push(Span::raw(" ".repeat(bar_indent)));
+    }
+    if bar_width == 0 || total.num_seconds() <= 0 || segments.is_empty() {
+        if right_padding {
+            spans.push(Span::raw(" "));
+        }
+        return Line::from(spans);
+    }
+    let allocations = allocate_segment_widths(segments, total.num_seconds(), bar_width);
+    for (style, width) in allocations {
+        if width > 0 {
+            spans.push(Span::styled("█".repeat(width), style));
+        }
+    }
+    if right_padding {
+        spans.push(Span::raw(" "));
+    }
+    Line::from(spans)
+}
+
+fn build_single_color_bar_line(
+    bar_indent: usize,
+    bar_width: usize,
+    style: Style,
+    right_padding: bool,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    if bar_indent > 0 {
+        spans.push(Span::raw(" ".repeat(bar_indent)));
+    }
+    if bar_width > 0 {
+        spans.push(Span::styled("█".repeat(bar_width), style));
+    }
+    if right_padding {
+        spans.push(Span::raw(" "));
+    }
+    Line::from(spans)
+}
+
+fn allocate_segment_widths(
+    segments: &[ProjectSummaryRow],
+    total_seconds: i64,
+    bar_width: usize,
+) -> Vec<(Style, usize)> {
+    if bar_width == 0 || total_seconds <= 0 || segments.is_empty() {
+        return Vec::new();
+    }
+
+    let mut widths = vec![0usize; segments.len()];
+    let mut remainders = Vec::with_capacity(segments.len());
+    let mut used = 0usize;
+
+    for (index, segment) in segments.iter().enumerate() {
+        let seconds = segment.duration.num_seconds().max(0);
+        let scaled = seconds as i128 * bar_width as i128;
+        let width = (scaled / total_seconds as i128) as usize;
+        let remainder = (scaled % total_seconds as i128) as i128;
+        widths[index] = width;
+        remainders.push((index, remainder, seconds));
+        used += width;
+    }
+
+    if used == 0 {
+        if let Some((index, _, _)) = remainders
+            .iter()
+            .max_by(|left, right| left.2.cmp(&right.2).then_with(|| left.1.cmp(&right.1)))
+        {
+            widths[*index] = 1;
+            used = 1;
+        }
+    }
+
+    let mut remaining = bar_width.saturating_sub(used);
+    remainders.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    for (index, _, _) in remainders {
+        if remaining == 0 {
+            break;
+        }
+        widths[index] += 1;
+        remaining -= 1;
+    }
+
+    segments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, segment)| {
+            let width = widths[index];
+            if width == 0 {
+                None
+            } else {
+                Some((segment.style, width))
+            }
+        })
+        .collect()
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -2060,6 +2212,7 @@ fn build_week_stats(
     let mut max_day = Duration::zero();
     let mut active_days = 0usize;
     let mut project_totals: HashMap<String, Duration> = HashMap::new();
+    let mut daily_project_mix = Vec::new();
 
     for offset in 0..7 {
         let day = week_start + Duration::days(offset);
@@ -2077,13 +2230,41 @@ fn build_week_stats(
         total += day_total;
         daily.push((day, day_total));
 
+        let mut day_project_totals: HashMap<String, Duration> = HashMap::new();
         for (task_id, duration) in durations {
             if let Some(task) = ledger.task(&task_id) {
                 *project_totals
                     .entry(task.project_id.clone())
                     .or_insert_with(Duration::zero) += duration;
+                *day_project_totals
+                    .entry(task.project_id.clone())
+                    .or_insert_with(Duration::zero) += duration;
             }
         }
+
+        let mut day_projects = day_project_totals
+            .iter()
+            .map(|(project_id, duration)| {
+                let project = ledger.project(project_id);
+                let name = project
+                    .map(|project| project.name.clone())
+                    .unwrap_or_else(|| "Unknown project".to_string());
+                let style =
+                    style_from_project_color(project.and_then(|project| project.color.as_deref()));
+                ProjectSummaryRow {
+                    name,
+                    style,
+                    duration: *duration,
+                }
+            })
+            .collect::<Vec<_>>();
+        day_projects.sort_by(|left, right| {
+            right
+                .duration
+                .cmp(&left.duration)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        daily_project_mix.push(day_projects);
     }
 
     let avg_per_day = Duration::seconds(total.num_seconds() / 7);
@@ -2120,6 +2301,7 @@ fn build_week_stats(
         active_days,
         project_totals,
         top_projects,
+        daily_project_mix,
     }
 }
 
@@ -3365,6 +3547,7 @@ struct WeekStatsView {
     active_days: usize,
     project_totals: HashMap<String, Duration>,
     top_projects: Vec<ProjectSummaryRow>,
+    daily_project_mix: Vec<Vec<ProjectSummaryRow>>,
 }
 
 #[derive(Clone)]
