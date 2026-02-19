@@ -80,6 +80,7 @@ fn run_event_loop(
 				let should_quit = match &app.mode {
 					InputMode::Prompt(_) => handle_prompt_key(&mut app, key, ledger, ledger_path),
 					InputMode::Select(_) => handle_select_key(&mut app, key.code, ledger, ledger_path),
+					InputMode::Edit(_) => handle_edit_key(&mut app, key, ledger, ledger_path),
 					InputMode::Normal => {
 						handle_normal_key(&mut app, key.code, ledger, ledger_path, &snapshot, &view)
 					}
@@ -124,6 +125,7 @@ fn draw_dashboard(frame: &mut Frame, app: &App, view: &ViewModel) {
 	match &app.mode {
 		InputMode::Select(select) => render_select_popup(frame, select),
 		InputMode::Prompt(prompt) => render_prompt_popup(frame, prompt),
+		InputMode::Edit(edit) => render_edit_popup(frame, edit),
 		InputMode::Normal => {}
 	}
 }
@@ -312,7 +314,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 				"Tab pane | arrows/hjkl navigate | Enter open/collapse (explorer) | q quit",
 			),
 			Line::from(
-				"space start/stop (day+explorer) | d delete interval(day) | o new task | p project | c category | t task | s session note | g switch ledger",
+				"space start/stop (day+explorer) | d delete interval(day) | o new task | p project | c category | t task | e edit | s session note | g switch ledger",
 			),
 			Line::from(format!(
 				"{}{}",
@@ -340,6 +342,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 			)),
 			Line::from("j/k or arrows move | Enter choose | Esc cancel"),
 		],
+		InputMode::Edit(edit) => {
+			let key_line = if edit.editing {
+				"Enter save field | Ctrl+J newline | Esc cancel"
+			} else {
+				"Up/Down move | Enter edit/toggle | Left/Right cycle | Ctrl+S save | Esc cancel"
+			};
+			vec![
+				Line::from(edit.title.clone()),
+				Line::from(key_line),
+				Line::from(app.status.clone()),
+			]
+		}
 	};
 
 	let footer = Paragraph::new(footer_lines).block(
@@ -470,6 +484,44 @@ fn render_prompt_popup(frame: &mut Frame, prompt: &PromptState) {
 	frame.render_widget(paragraph, area);
 }
 
+fn render_edit_popup(frame: &mut Frame, edit: &EditState) {
+	let area = centered_rect(74, 70, frame.area());
+	frame.render_widget(Clear, area);
+
+	let block = Block::default()
+		.borders(Borders::ALL)
+		.title(edit.title.clone())
+		.border_style(Style::default().fg(FOCUSED_PANEL_BORDER_COLOR).add_modifier(Modifier::BOLD));
+	let inner = block.inner(area);
+	frame.render_widget(block, area);
+
+	let content_layout = Layout::default()
+		.direction(Direction::Vertical)
+		.constraints([Constraint::Min(8), Constraint::Length(6)])
+		.split(inner);
+
+	let items = edit
+		.fields
+		.iter()
+		.map(|field| {
+			let value = edit_field_display_value(field);
+			ListItem::new(format!("{}: {}", field.label, value))
+		})
+		.collect::<Vec<_>>();
+	let list = List::new(items)
+		.highlight_symbol(">> ")
+		.highlight_style(Style::default().bg(HIGHLIGHT_BACKGROUND_COLOR));
+	let mut state = ListState::default();
+	if !edit.fields.is_empty() {
+		state.select(Some(edit.selected.min(edit.fields.len().saturating_sub(1))));
+	}
+	frame.render_stateful_widget(list, content_layout[0], &mut state);
+
+	let hint_lines = build_edit_hint_lines(edit);
+	let hint_panel = Paragraph::new(hint_lines);
+	frame.render_widget(hint_panel, content_layout[1]);
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 	let popup_layout = Layout::default()
 		.direction(Direction::Vertical)
@@ -584,6 +636,17 @@ fn handle_normal_key(
 			app.mode = InputMode::Prompt(PromptState::new("Category name", PromptKind::AddCategoryName));
 			false
 		}
+		KeyCode::Char('e') => {
+			if app.focus != FocusPane::Explorer {
+				app.status = "Focus the Explorer to edit items".to_string();
+				return false;
+			}
+			match build_edit_state_for_explorer(app, ledger, view) {
+				Ok(edit_state) => app.mode = InputMode::Edit(edit_state),
+				Err(err) => app.status = err,
+			}
+			false
+		}
 		KeyCode::Char('t') => {
 			match build_task_project_select(ledger) {
 				Ok(select) => app.mode = InputMode::Select(select),
@@ -696,7 +759,7 @@ fn handle_normal_key(
 						};
 						app.explorer_index = 0;
 					}
-					Some(ExplorerRowKind::Category { key }) => {
+					Some(ExplorerRowKind::Category { key, .. }) => {
 						if app.explorer_collapsed_categories.contains(&key) {
 							app.explorer_collapsed_categories.remove(&key);
 						} else {
@@ -926,7 +989,7 @@ fn handle_prompt_key(
 fn submit_active_prompt(app: &mut App, ledger: &mut Ledger, ledger_path: &Path) {
 	let prompt = match std::mem::replace(&mut app.mode, InputMode::Normal) {
 		InputMode::Prompt(prompt) => prompt,
-		InputMode::Normal | InputMode::Select(_) => return,
+		InputMode::Normal | InputMode::Select(_) | InputMode::Edit(_) => return,
 	};
 
 	match submit_prompt(prompt.clone(), ledger, ledger_path) {
@@ -984,6 +1047,94 @@ fn handle_select_key(
 			}
 		}
 		_ => {}
+	}
+
+	false
+}
+
+fn handle_edit_key(
+	app: &mut App,
+	key: KeyEvent,
+	ledger: &mut Ledger,
+	ledger_path: &mut PathBuf,
+) -> bool {
+	let mut cancel_edit = false;
+	let mut save_result: Option<Result<String, String>> = None;
+
+	{
+		let InputMode::Edit(edit) = &mut app.mode else {
+			return false;
+		};
+
+		if edit.editing {
+			match key.code {
+				KeyCode::Esc => {
+					edit.editing = false;
+					edit.input.clear();
+				}
+				KeyCode::Backspace => {
+					edit.input.pop();
+				}
+				KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+					if edit_selected_field_multiline(edit) {
+						edit.input.push('\n');
+					}
+				}
+				KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
+					commit_edit_field_input(edit);
+				}
+				KeyCode::Char(value) => {
+					edit.input.push(value);
+				}
+				_ => {}
+			}
+		} else {
+			match key.code {
+				KeyCode::Esc => {
+					cancel_edit = true;
+				}
+				KeyCode::Up | KeyCode::Char('k') => {
+					edit.move_selection(-1);
+				}
+				KeyCode::Down | KeyCode::Char('j') => {
+					edit.move_selection(1);
+				}
+				KeyCode::Left | KeyCode::Char('h') => {
+					cycle_edit_field(edit, -1);
+				}
+				KeyCode::Right | KeyCode::Char('l') => {
+					cycle_edit_field(edit, 1);
+				}
+				KeyCode::Enter => {
+					activate_edit_field(edit);
+				}
+				KeyCode::Char(' ') => {
+					cycle_edit_field(edit, 1);
+				}
+				KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+					save_result = Some(submit_edit(edit, ledger, ledger_path.as_path()));
+				}
+				_ => {}
+			}
+		}
+	}
+
+	if cancel_edit {
+		app.mode = InputMode::Normal;
+		app.status = "Edit cancelled".to_string();
+		return false;
+	}
+
+	if let Some(result) = save_result {
+		match result {
+			Ok(message) => {
+				app.mode = InputMode::Normal;
+				app.status = message;
+			}
+			Err(err) => {
+				app.status = format!("error: {err}");
+			}
+		}
 	}
 
 	false
@@ -1103,6 +1254,82 @@ fn submit_select(
 			} else {
 				Ok(SelectOutcome::Done("Delete cancelled".to_string()))
 			}
+		}
+	}
+}
+
+fn submit_edit(edit: &EditState, ledger: &mut Ledger, ledger_path: &Path) -> Result<String, String> {
+	match &edit.entity {
+		EditEntity::Project { id } => {
+			let name_value = edit_field_text_value(edit, EditFieldId::Name)?;
+			let color = edit_field_choice_value(edit, EditFieldId::Color)?;
+			let archived = edit_field_bool_value(edit, EditFieldId::Archived)?;
+			let name = required_text(&name_value, "project name")?;
+
+			let project = ledger
+				.header
+				.projects
+				.iter_mut()
+				.find(|project| project.id == *id)
+				.ok_or_else(|| format!("project not found: {id}"))?;
+			project.name = name.clone();
+			project.color = color;
+			project.archived = archived;
+
+			persist(ledger_path, ledger)?;
+			Ok(format!("updated project: {name}"))
+		}
+		EditEntity::Category { id } => {
+			let name_value = edit_field_text_value(edit, EditFieldId::Name)?;
+			let description_value = edit_field_text_value(edit, EditFieldId::Description)?;
+			let archived = edit_field_bool_value(edit, EditFieldId::Archived)?;
+			let name = required_text(&name_value, "category name")?;
+			let description = optional_text(&description_value);
+
+			let category = ledger
+				.header
+				.categories
+				.iter_mut()
+				.find(|category| category.id == *id)
+				.ok_or_else(|| format!("category not found: {id}"))?;
+			category.name = name.clone();
+			category.description = description;
+			category.archived = archived;
+
+			persist(ledger_path, ledger)?;
+			Ok(format!("updated category: {name}"))
+		}
+		EditEntity::Task { id } => {
+			let description_value = edit_field_text_value(edit, EditFieldId::Description)?;
+			let project_id = edit_field_choice_value(edit, EditFieldId::Project)?
+				.ok_or_else(|| "project is required".to_string())?;
+			let category_id = edit_field_choice_value(edit, EditFieldId::Category)?;
+			let archived = edit_field_bool_value(edit, EditFieldId::Archived)?;
+			let description = required_text(&description_value, "task description")?;
+
+			if ledger.project(&project_id).is_none() {
+				return Err(format!("project not found: {project_id}"));
+			}
+			if let Some(category_id) = &category_id {
+				if ledger.category(category_id).is_none() {
+					return Err(format!("category not found: {category_id}"));
+				}
+			}
+
+			let task = ledger
+				.header
+				.tasks
+				.iter_mut()
+				.find(|task| task.id == *id)
+				.ok_or_else(|| format!("task not found: {id}"))?;
+			task.description = description.clone();
+			task.project_id = project_id;
+			task.category_id = category_id;
+			task.archived = archived;
+
+			persist(ledger_path, ledger)?;
+			let label = description.lines().next().unwrap_or("(no description)");
+			Ok(format!("updated task: {label}"))
 		}
 	}
 }
@@ -1252,6 +1479,159 @@ fn build_delete_interval_select(row: &DaySessionRow, start_event_index: usize) -
 	// Default to cancel to prevent accidental deletions.
 	select.selected = 1;
 	select
+}
+
+fn build_edit_state_for_explorer(app: &App, ledger: &Ledger, view: &ViewModel) -> Result<EditState, String> {
+	let selection = app
+		.selected_explorer_row_kind(view)
+		.ok_or_else(|| "Select a project, category, or task in Explorer".to_string())?;
+
+	match selection {
+		ExplorerRowKind::Project { project_id, .. } => build_project_edit_state(ledger, &project_id),
+		ExplorerRowKind::Task { task_id, .. } => build_task_edit_state(ledger, &task_id),
+		ExplorerRowKind::Category {
+			category_id: Some(category_id),
+			..
+		} => build_category_edit_state(ledger, &category_id),
+		ExplorerRowKind::Category { category_id: None, .. } => {
+			Err("Uncategorized entries have no category to edit".to_string())
+		}
+		ExplorerRowKind::Empty => Err("Select a project, category, or task in Explorer".to_string()),
+	}
+}
+
+fn build_project_edit_state(ledger: &Ledger, project_id: &str) -> Result<EditState, String> {
+	let project = ledger
+		.project(project_id)
+		.ok_or_else(|| format!("project not found: {project_id}"))?;
+
+	let fields = vec![
+		EditField::text(EditFieldId::Name, "Name", project.name.clone(), false, false),
+		EditField::choice(
+			EditFieldId::Color,
+			"Color",
+			project.color.clone(),
+			build_color_options(),
+		),
+		EditField::bool(EditFieldId::Archived, "Archived", project.archived),
+	];
+
+	Ok(EditState::new(
+		format!("Edit project: {}", project.name),
+		EditEntity::Project {
+			id: project.id.clone(),
+		},
+		fields,
+	))
+}
+
+fn build_category_edit_state(ledger: &Ledger, category_id: &str) -> Result<EditState, String> {
+	let category = ledger
+		.category(category_id)
+		.ok_or_else(|| format!("category not found: {category_id}"))?;
+
+	let fields = vec![
+		EditField::text(EditFieldId::Name, "Name", category.name.clone(), false, false),
+		EditField::text(
+			EditFieldId::Description,
+			"Description",
+			category.description.clone().unwrap_or_default(),
+			true,
+			true,
+		),
+		EditField::bool(EditFieldId::Archived, "Archived", category.archived),
+	];
+
+	Ok(EditState::new(
+		format!("Edit category: {}", category.name),
+		EditEntity::Category {
+			id: category.id.clone(),
+		},
+		fields,
+	))
+}
+
+fn build_task_edit_state(ledger: &Ledger, task_id: &str) -> Result<EditState, String> {
+	let task = ledger
+		.task(task_id)
+		.ok_or_else(|| format!("task not found: {task_id}"))?;
+	let project_options = build_project_options(ledger);
+	if project_options.is_empty() {
+		return Err("no projects available to assign".to_string());
+	}
+
+	let fields = vec![
+		EditField::text(
+			EditFieldId::Description,
+			"Description",
+			task.description.clone(),
+			true,
+			false,
+		),
+		EditField::choice(
+			EditFieldId::Project,
+			"Project",
+			Some(task.project_id.clone()),
+			project_options,
+		),
+		EditField::choice(
+			EditFieldId::Category,
+			"Category",
+			task.category_id.clone(),
+			build_category_options(ledger, true),
+		),
+		EditField::bool(EditFieldId::Archived, "Archived", task.archived),
+	];
+
+	let title = task.short_description();
+	Ok(EditState::new(
+		format!("Edit task: {title}"),
+		EditEntity::Task { id: task.id.clone() },
+		fields,
+	))
+}
+
+fn build_project_options(ledger: &Ledger) -> Vec<EditOption> {
+	let mut projects = ledger.header.projects.iter().collect::<Vec<_>>();
+	projects.sort_by(|left, right| left.name.cmp(&right.name).then_with(|| left.id.cmp(&right.id)));
+	projects
+		.into_iter()
+		.map(|project| {
+			let label = if project.archived {
+				format!("{} [archived]", project.name)
+			} else {
+				project.name.clone()
+			};
+			EditOption::new(label, Some(project.id.clone()))
+		})
+		.collect()
+}
+
+fn build_category_options(ledger: &Ledger, include_uncategorized: bool) -> Vec<EditOption> {
+	let mut categories = ledger.header.categories.iter().collect::<Vec<_>>();
+	categories.sort_by(|left, right| left.name.cmp(&right.name).then_with(|| left.id.cmp(&right.id)));
+
+	let mut options = Vec::new();
+	if include_uncategorized {
+		options.push(EditOption::new("Uncategorized", None));
+	}
+	for category in categories {
+		let label = if category.archived {
+			format!("{} [archived]", category.name)
+		} else {
+			category.name.clone()
+		};
+		options.push(EditOption::new(label, Some(category.id.clone())));
+	}
+	options
+}
+
+fn build_color_options() -> Vec<EditOption> {
+	let mut options = vec![EditOption::new("No color", None)];
+	for color in TERMINAL_COLORS {
+		options.push(EditOption::new(color.to_string(), Some(color.to_string())));
+	}
+	options
 }
 
 fn build_view(app: &App, ledger: &Ledger, snapshot: &LedgerSnapshot, now: DateTime<Utc>) -> ViewModel {
@@ -1551,7 +1931,7 @@ fn build_explorer_rows(
 					.then_with(|| left.id.cmp(&right.id))
 			});
 
-			let mut grouped: BTreeMap<String, (String, Vec<&Task>)> = BTreeMap::new();
+			let mut grouped: BTreeMap<String, (String, Option<String>, Vec<&Task>)> = BTreeMap::new();
 			for task in tasks {
 				let label = task
 					.category_id
@@ -1562,12 +1942,12 @@ fn build_explorer_rows(
 				let key = explorer_category_key(project_id, task.category_id.as_deref());
 				grouped
 					.entry(key)
-					.and_modify(|(_, entries)| entries.push(task))
-					.or_insert_with(|| (label, vec![task]));
+					.and_modify(|(_, _, entries)| entries.push(task))
+					.or_insert_with(|| (label, task.category_id.clone(), vec![task]));
 			}
 
 			let mut rows = Vec::new();
-			for (key, (label, mut category_tasks)) in grouped {
+			for (key, (label, category_id, mut category_tasks)) in grouped {
 				category_tasks.sort_by(|left, right| {
 					left
 						.short_description()
@@ -1583,7 +1963,10 @@ fn build_explorer_rows(
 						label,
 						category_tasks.len()
 					)),
-					kind: ExplorerRowKind::Category { key: key.clone() },
+					kind: ExplorerRowKind::Category {
+						key: key.clone(),
+						category_id: category_id.clone(),
+					},
 				});
 
 				if is_collapsed {
@@ -1724,6 +2107,176 @@ fn optional_text(input: &str) -> Option<String> {
 		None
 	} else {
 		Some(value.to_string())
+	}
+}
+
+fn edit_field_display_value(field: &EditField) -> String {
+	match &field.kind {
+		EditFieldKind::Text {
+			value,
+			multiline: _,
+			optional,
+		} => {
+			let trimmed = value.trim_end_matches('\n');
+			if trimmed.is_empty() {
+				if *optional {
+					return "(none)".to_string();
+				}
+				return "(empty)".to_string();
+			}
+			let mut lines = trimmed.lines();
+			let first = lines.next().unwrap_or("");
+			if lines.next().is_some() {
+				format!("{first}...")
+			} else {
+				first.to_string()
+			}
+		}
+		EditFieldKind::Bool { value } => {
+			if *value {
+				"Yes".to_string()
+			} else {
+				"No".to_string()
+			}
+		}
+		EditFieldKind::Choice { value, options } => options
+			.iter()
+			.find(|option| option.value == *value)
+			.map(|option| option.label.clone())
+			.unwrap_or_else(|| "(unknown)".to_string()),
+	}
+}
+
+fn build_edit_hint_lines(edit: &EditState) -> Vec<Line<'static>> {
+	let mut lines = Vec::new();
+	if edit.editing {
+		let label = edit
+			.fields
+			.get(edit.selected)
+			.map(|field| field.label.clone())
+			.unwrap_or_else(|| "Field".to_string());
+		lines.push(Line::from(format!("Editing: {label}")));
+
+		if edit.input.is_empty() {
+			lines.push(Line::from(""));
+		} else {
+			for part in edit.input.split('\n') {
+				lines.push(Line::from(part.to_string()));
+			}
+			if edit.input.ends_with('\n') {
+				lines.push(Line::from(""));
+			}
+		}
+
+		lines.push(Line::from(""));
+		lines.push(Line::from(Span::styled(
+			"Enter save field | Ctrl+J newline | Esc cancel",
+			Style::default().fg(Color::DarkGray),
+		)));
+	} else {
+		lines.push(Line::from(
+			"Up/Down move | Enter edit/toggle | Left/Right cycle",
+		));
+		lines.push(Line::from("Ctrl+S save | Esc cancel"));
+	}
+	lines
+}
+
+fn activate_edit_field(edit: &mut EditState) {
+	let Some(field) = edit.fields.get(edit.selected) else {
+		return;
+	};
+	match &field.kind {
+		EditFieldKind::Text { value, .. } => {
+			edit.editing = true;
+			edit.input = value.clone();
+		}
+		EditFieldKind::Bool { .. } | EditFieldKind::Choice { .. } => {
+			cycle_edit_field(edit, 1);
+		}
+	}
+}
+
+fn cycle_edit_field(edit: &mut EditState, delta: i32) {
+	let Some(field) = edit.fields.get_mut(edit.selected) else {
+		return;
+	};
+	match &mut field.kind {
+		EditFieldKind::Bool { value } => {
+			*value = !*value;
+		}
+		EditFieldKind::Choice { value, options } => {
+			if options.is_empty() {
+				return;
+			}
+			let current = options
+				.iter()
+				.position(|option| option.value == *value)
+				.unwrap_or(0);
+			let len = options.len() as i32;
+			let mut next_index = current as i32 + delta;
+			next_index = (next_index % len + len) % len;
+			*value = options[next_index as usize].value.clone();
+		}
+		EditFieldKind::Text { .. } => {}
+	}
+}
+
+fn commit_edit_field_input(edit: &mut EditState) {
+	let Some(field) = edit.fields.get_mut(edit.selected) else {
+		return;
+	};
+	if let EditFieldKind::Text { value, .. } = &mut field.kind {
+		*value = edit.input.clone();
+	}
+	edit.editing = false;
+	edit.input.clear();
+}
+
+fn edit_selected_field_multiline(edit: &EditState) -> bool {
+	edit
+		.fields
+		.get(edit.selected)
+		.and_then(|field| match &field.kind {
+			EditFieldKind::Text { multiline, .. } => Some(*multiline),
+			_ => None,
+		})
+		.unwrap_or(false)
+}
+
+fn edit_field_text_value(edit: &EditState, id: EditFieldId) -> Result<String, String> {
+	let field = edit
+		.fields
+		.iter()
+		.find(|field| field.id == id)
+		.ok_or_else(|| format!("missing field {id:?}"))?;
+	match &field.kind {
+		EditFieldKind::Text { value, .. } => Ok(value.clone()),
+		_ => Err(format!("field {id:?} is not text")),
+	}
+}
+
+fn edit_field_choice_value(edit: &EditState, id: EditFieldId) -> Result<Option<String>, String> {
+	let field = edit
+		.fields
+		.iter()
+		.find(|field| field.id == id)
+		.ok_or_else(|| format!("missing field {id:?}"))?;
+	match &field.kind {
+		EditFieldKind::Choice { value, .. } => Ok(value.clone()),
+		_ => Err(format!("field {id:?} is not a choice")),
+	}
+}
+
+fn edit_field_bool_value(edit: &EditState, id: EditFieldId) -> Result<bool, String> {
+	let field = edit
+		.fields
+		.iter()
+		.find(|field| field.id == id)
+		.ok_or_else(|| format!("missing field {id:?}"))?;
+	match &field.kind {
+		EditFieldKind::Bool { value } => Ok(*value),
+		_ => Err(format!("field {id:?} is not boolean")),
 	}
 }
 
@@ -1953,6 +2506,138 @@ impl SelectOption {
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditFieldId {
+	Name,
+	Description,
+	Color,
+	Project,
+	Category,
+	Archived,
+}
+
+#[derive(Debug, Clone)]
+enum EditFieldKind {
+	Text {
+		value: String,
+		multiline: bool,
+		optional: bool,
+	},
+	Bool {
+		value: bool,
+	},
+	Choice {
+		value: Option<String>,
+		options: Vec<EditOption>,
+	},
+}
+
+#[derive(Debug, Clone)]
+struct EditOption {
+	label: String,
+	value: Option<String>,
+}
+
+impl EditOption {
+	fn new(label: impl Into<String>, value: Option<String>) -> Self {
+		Self {
+			label: label.into(),
+			value,
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+struct EditField {
+	id: EditFieldId,
+	label: String,
+	kind: EditFieldKind,
+}
+
+impl EditField {
+	fn text(
+		id: EditFieldId,
+		label: impl Into<String>,
+		value: String,
+		multiline: bool,
+		optional: bool,
+	) -> Self {
+		Self {
+			id,
+			label: label.into(),
+			kind: EditFieldKind::Text {
+				value,
+				multiline,
+				optional,
+			},
+		}
+	}
+
+	fn bool(id: EditFieldId, label: impl Into<String>, value: bool) -> Self {
+		Self {
+			id,
+			label: label.into(),
+			kind: EditFieldKind::Bool { value },
+		}
+	}
+
+	fn choice(
+		id: EditFieldId,
+		label: impl Into<String>,
+		value: Option<String>,
+		options: Vec<EditOption>,
+	) -> Self {
+		Self {
+			id,
+			label: label.into(),
+			kind: EditFieldKind::Choice { value, options },
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+enum EditEntity {
+	Project { id: String },
+	Category { id: String },
+	Task { id: String },
+}
+
+#[derive(Debug, Clone)]
+struct EditState {
+	title: String,
+	entity: EditEntity,
+	fields: Vec<EditField>,
+	selected: usize,
+	editing: bool,
+	input: String,
+}
+
+impl EditState {
+	fn new(title: impl Into<String>, entity: EditEntity, fields: Vec<EditField>) -> Self {
+		Self {
+			title: title.into(),
+			entity,
+			fields,
+			selected: 0,
+			editing: false,
+			input: String::new(),
+		}
+	}
+
+	fn move_selection(&mut self, delta: i32) {
+		if self.fields.is_empty() {
+			self.selected = 0;
+			return;
+		}
+
+		if delta > 0 {
+			self.selected = (self.selected + delta as usize).min(self.fields.len() - 1);
+		} else {
+			self.selected = self.selected.saturating_sub(delta.unsigned_abs() as usize);
+		}
+	}
+}
+
 #[derive(Debug, Clone)]
 enum PromptKind {
 	AddProjectName,
@@ -2035,6 +2720,7 @@ enum InputMode {
 	Normal,
 	Prompt(PromptState),
 	Select(SelectState),
+	Edit(EditState),
 }
 
 #[derive(Debug, Clone)]
@@ -2245,6 +2931,7 @@ enum ExplorerRowKind {
 	},
 	Category {
 		key: String,
+		category_id: Option<String>,
 	},
 	Task {
 		task_id: String,
