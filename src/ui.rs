@@ -193,8 +193,15 @@ fn render_calendar_panel(
 
 fn render_explorer_panel(frame: &mut Frame, area: Rect, app: &App, view: &ViewModel) {
     let title = match &app.explorer_mode {
-        ExplorerMode::Projects => "Explorer: Projects".to_string(),
-        ExplorerMode::ProjectTasks { project_name, .. } => format!("Explorer: {project_name}"),
+        ExplorerMode::Projects => Line::from("Explorer: Projects"),
+        ExplorerMode::ProjectTasks {
+            project_name,
+            project_style,
+            ..
+        } => Line::from(vec![
+            Span::raw("Explorer: "),
+            Span::styled(project_name.clone(), *project_style),
+        ]),
     };
 
     let items = view
@@ -536,12 +543,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
 
-    let footer = Paragraph::new(footer_lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Shortcuts")
-            .border_style(Style::default().fg(INACTIVE_PANEL_BORDER_COLOR)),
-    );
+    let footer = Paragraph::new(footer_lines)
+        .style(Style::default().fg(Color::DarkGray))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Shortcuts")
+                .border_style(Style::default().fg(INACTIVE_PANEL_BORDER_COLOR)),
+        );
     frame.render_widget(footer, area);
 }
 
@@ -987,9 +996,15 @@ fn handle_normal_key(
                         project_id,
                         project_name,
                     }) => {
+                        let project_style = style_from_project_color(
+                            ledger
+                                .project(&project_id)
+                                .and_then(|project| project.color.as_deref()),
+                        );
                         app.explorer_mode = ExplorerMode::ProjectTasks {
                             project_id,
                             project_name,
+                            project_style,
                         };
                         app.explorer_index = 0;
                     }
@@ -2346,6 +2361,7 @@ fn build_explorer_rows(
         ExplorerMode::ProjectTasks {
             project_id,
             project_name: _,
+            project_style: _,
         } => {
             let mut tasks = ledger
                 .header
@@ -3355,6 +3371,7 @@ enum ExplorerMode {
     ProjectTasks {
         project_id: String,
         project_name: String,
+        project_style: Style,
     },
 }
 
