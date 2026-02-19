@@ -236,11 +236,7 @@ fn render_selected_day_panel(frame: &mut Frame, area: Rect, app: &App, view: &Vi
 		state.select(Some(app.day_index.min(view.day_rows.len() - 1)));
 	}
 
-	let title = format!(
-		"{} | total {}",
-		app.selected_day.format("%A, %d %B %Y"),
-		format_duration(view.day_total)
-	);
+	let title = format!("{}", app.selected_day.format("%A, %d %B %Y"));
 	let list = List::new(items)
 		.block(
 			Block::default()
