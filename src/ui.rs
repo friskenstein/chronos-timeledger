@@ -2383,21 +2383,45 @@ fn build_explorer_rows(
 
             let mut grouped: BTreeMap<String, (String, Option<String>, Vec<&Task>)> =
                 BTreeMap::new();
+            let mut uncategorized = Vec::new();
             for task in tasks {
-                let label = task
-                    .category_id
-                    .as_ref()
-                    .and_then(|id| ledger.category(id))
-                    .map(|category| category.name.clone())
-                    .unwrap_or_else(|| "Uncategorized".to_string());
-                let key = explorer_category_key(project_id, task.category_id.as_deref());
-                grouped
-                    .entry(key)
-                    .and_modify(|(_, _, entries)| entries.push(task))
-                    .or_insert_with(|| (label, task.category_id.clone(), vec![task]));
+                match task.category_id.as_ref() {
+                    Some(category_id) => {
+                        let label = ledger
+                            .category(category_id)
+                            .map(|category| category.name.clone())
+                            .unwrap_or_else(|| "Uncategorized".to_string());
+                        let key = explorer_category_key(project_id, Some(category_id));
+                        grouped
+                            .entry(key)
+                            .and_modify(|(_, _, entries)| entries.push(task))
+                            .or_insert_with(|| (label, task.category_id.clone(), vec![task]));
+                    }
+                    None => uncategorized.push(task),
+                }
             }
 
             let mut rows = Vec::new();
+            if !uncategorized.is_empty() {
+                uncategorized.sort_by(|left, right| {
+                    left.short_description()
+                        .cmp(&right.short_description())
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+
+                for task in uncategorized {
+                    let is_running = snapshot.active_tasks.contains_key(&task.id);
+                    let running_marker = if is_running { "\u{f04b} " } else { "" };
+                    rows.push(ExplorerRow {
+                        line: Line::from(format!("{}{}", running_marker, task.short_description())),
+                        kind: ExplorerRowKind::Task {
+                            task_id: task.id.clone(),
+                            project_id: project_id.clone(),
+                        },
+                    });
+                }
+            }
+
             for (key, (label, category_id, mut category_tasks)) in grouped {
                 category_tasks.sort_by(|left, right| {
                     left.short_description()
@@ -2409,7 +2433,7 @@ fn build_explorer_rows(
                 rows.push(ExplorerRow {
                     line: Line::from(format!(
                         "{} {} ({})",
-                        if is_collapsed { "[+]" } else { "[-]" },
+                        if is_collapsed { "\u{f07b}" } else { "\u{eaf7}" },
                         label,
                         category_tasks.len()
                     )),
@@ -2425,10 +2449,11 @@ fn build_explorer_rows(
 
                 for task in category_tasks {
                     let is_running = snapshot.active_tasks.contains_key(&task.id);
+                    let running_marker = if is_running { "\u{f04b} " } else { "" };
                     rows.push(ExplorerRow {
                         line: Line::from(format!(
-                            "  {} {}",
-                            if is_running { "RUN" } else { "   " },
+                            "  {}{}",
+                            running_marker,
                             task.short_description()
                         )),
                         kind: ExplorerRowKind::Task {
