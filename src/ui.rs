@@ -643,7 +643,14 @@ fn render_day_row_item(
         Style::default().fg(Color::DarkGray)
     };
 
-    let mut timing_spans = vec![
+    let mut timing_spans = Vec::new();
+    if row.stop_event_index.is_none() {
+        timing_spans.push(Span::styled(
+            "\u{f04b} ",
+            Style::default().fg(Color::LightGreen),
+        ));
+    }
+    timing_spans.extend(vec![
         Span::styled(start_text, start_style),
         Span::raw(" -> "),
         Span::styled(end_text, end_style),
@@ -651,7 +658,7 @@ fn render_day_row_item(
             " {}",
             format_duration(row.display_stop - row.display_start)
         )),
-    ];
+    ]);
 
     if show_task_label {
         timing_spans.push(Span::raw(format!(" {}", row.task_title)));
