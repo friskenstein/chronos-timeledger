@@ -162,14 +162,6 @@ fn print_recent_ledgers(limit: usize) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn parse_day(input: Option<&str>) -> Result<NaiveDate, Box<dyn Error>> {
-    if let Some(raw) = input {
-        Ok(NaiveDate::parse_from_str(raw, "%Y-%m-%d")?)
-    } else {
-        Ok(Utc::now().date_naive())
-    }
-}
-
 fn print_tasks(ledger: &Ledger) {
     if ledger.header.tasks.is_empty() {
         println!("no tasks yet");
@@ -198,8 +190,13 @@ fn print_tasks(ledger: &Ledger) {
 }
 
 fn print_summary(ledger: &Ledger, day: Option<&str>) -> Result<(), Box<dyn Error>> {
-    let day = parse_day(day)?;
-    let snapshot = ledger.snapshot(Utc::now());
+    let now = Utc::now();
+    let day = if let Some(raw) = day {
+        NaiveDate::parse_from_str(raw, "%Y-%m-%d")?
+    } else {
+        ledger.day_for_timestamp(now)
+    };
+    let snapshot = ledger.snapshot(now);
     let task_totals = snapshot.totals_for_day(day);
 
     println!("summary for {}", day.format("%Y-%m-%d"));

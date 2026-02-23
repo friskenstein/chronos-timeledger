@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +95,8 @@ impl TimeEvent {
 pub struct LedgerHeader {
     pub schema_version: u32,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub day_start_offset_hours: i32,
     pub projects: Vec<Project>,
     pub tasks: Vec<Task>,
     pub categories: Vec<Category>,
@@ -105,6 +107,7 @@ impl LedgerHeader {
         Self {
             schema_version: 1,
             created_at: Utc::now(),
+            day_start_offset_hours: 0,
             projects: Vec::new(),
             tasks: Vec::new(),
             categories: Vec::new(),
@@ -124,6 +127,18 @@ impl Ledger {
             header: LedgerHeader::new(),
             events: Vec::new(),
         }
+    }
+
+    pub fn day_start_offset(&self) -> Duration {
+        Duration::hours(self.header.day_start_offset_hours.into())
+    }
+
+    pub fn day_for_timestamp(&self, timestamp: DateTime<Utc>) -> NaiveDate {
+        ledger_day_for_timestamp(timestamp, self.day_start_offset())
+    }
+
+    pub fn day_bounds_utc(&self, day: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
+        ledger_day_bounds_utc(day, self.day_start_offset())
     }
 
     pub fn project(&self, id: &str) -> Option<&Project> {
@@ -241,6 +256,7 @@ impl Ledger {
 
         let mut active_tasks: HashMap<String, ActiveSession> = HashMap::new();
         let mut daily_task_totals: BTreeMap<NaiveDate, HashMap<String, Duration>> = BTreeMap::new();
+        let day_start_offset = self.day_start_offset();
 
         for event in events {
             match event.kind {
@@ -259,6 +275,7 @@ impl Ledger {
                             &task_id,
                             active_session.started_at,
                             event.timestamp,
+                            day_start_offset,
                         );
                     }
                 }
@@ -271,6 +288,7 @@ impl Ledger {
                 task_id,
                 active_session.started_at,
                 now,
+                day_start_offset,
             );
         }
 
@@ -312,34 +330,32 @@ fn accumulate_session(
     task_id: &str,
     start: DateTime<Utc>,
     stop: DateTime<Utc>,
+    day_start_offset: Duration,
 ) {
     if stop <= start {
         return;
     }
 
-    let mut cursor = start;
-    while cursor.date_naive() < stop.date_naive() {
-        let next_day = cursor
-            .date_naive()
-            .succ_opt()
-            .expect("next day should exist");
-        let day_boundary = DateTime::<Utc>::from_naive_utc_and_offset(
-            next_day
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight must be valid"),
-            Utc,
-        );
-        let slice = day_boundary - cursor;
-        add_daily_total(daily_task_totals, cursor.date_naive(), task_id, slice);
-        cursor = day_boundary;
-    }
+    let mut day = ledger_day_for_timestamp(start, day_start_offset);
+    let last_moment = stop - Duration::seconds(1);
+    let last_day = ledger_day_for_timestamp(last_moment, day_start_offset);
 
-    add_daily_total(
-        daily_task_totals,
-        cursor.date_naive(),
-        task_id,
-        stop - cursor,
-    );
+    while day <= last_day {
+        let (day_start, day_end) = ledger_day_bounds_utc(day, day_start_offset);
+        let slice_start = if start > day_start { start } else { day_start };
+        let slice_end = if stop < day_end { stop } else { day_end };
+
+        if slice_end > slice_start {
+            add_daily_total(
+                daily_task_totals,
+                day,
+                task_id,
+                slice_end - slice_start,
+            );
+        }
+
+        day = day.succ_opt().expect("next day should exist");
+    }
 }
 
 fn add_daily_total(
@@ -352,6 +368,49 @@ fn add_daily_total(
     *task_durations
         .entry(task_id.to_string())
         .or_insert_with(Duration::zero) += duration;
+}
+
+fn ledger_day_for_timestamp(timestamp: DateTime<Utc>, day_start_offset: Duration) -> NaiveDate {
+    let local_time = timestamp.with_timezone(&Local) - day_start_offset;
+    local_time.date_naive()
+}
+
+fn ledger_day_bounds_utc(
+    day: NaiveDate,
+    day_start_offset: Duration,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    let start_naive = day
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight must be valid")
+        + day_start_offset;
+    let end_naive = start_naive + Duration::days(1);
+    let start = local_naive_to_utc_resolved(start_naive);
+    let end = local_naive_to_utc_resolved(end_naive);
+    (start, end)
+}
+
+fn local_naive_to_utc(naive: NaiveDateTime) -> Option<DateTime<Utc>> {
+    match Local.from_local_datetime(&naive) {
+        LocalResult::Single(local_datetime) => Some(local_datetime.with_timezone(&Utc)),
+        LocalResult::Ambiguous(first, second) => Some(first.min(second).with_timezone(&Utc)),
+        LocalResult::None => None,
+    }
+}
+
+fn local_naive_to_utc_resolved(naive: NaiveDateTime) -> DateTime<Utc> {
+    if let Some(timestamp) = local_naive_to_utc(naive) {
+        return timestamp;
+    }
+
+    let mut cursor = naive + Duration::minutes(1);
+    for _ in 0..120 {
+        if let Some(timestamp) = local_naive_to_utc(cursor) {
+            return timestamp;
+        }
+        cursor += Duration::minutes(1);
+    }
+
+    panic!("local day boundary does not exist");
 }
 
 pub fn generate_id() -> String {
@@ -416,11 +475,9 @@ mod tests {
             )
             .expect("stop should work");
 
-        let snapshot = ledger.snapshot(Utc.with_ymd_and_hms(2026, 1, 1, 10, 30, 0).unwrap());
-        let day = Utc
-            .with_ymd_and_hms(2026, 1, 1, 10, 30, 0)
-            .unwrap()
-            .date_naive();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 10, 30, 0).unwrap();
+        let snapshot = ledger.snapshot(now);
+        let day = ledger.day_for_timestamp(now);
         let task_totals = snapshot.totals_for_day(day);
         let total_for = |task_id: &str| {
             task_totals

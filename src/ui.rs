@@ -66,7 +66,7 @@ fn run_event_loop(
     ledger: &mut Ledger,
     ledger_path: &mut PathBuf,
 ) -> Result<(), Box<dyn Error>> {
-    let mut app = App::default();
+    let mut app = App::new(ledger, Utc::now());
 
     loop {
         let now = Utc::now();
@@ -2164,7 +2164,7 @@ fn build_view(
     now: DateTime<Utc>,
 ) -> ViewModel {
     let sessions = collect_sessions(ledger, now);
-    let daily_task_totals = build_local_daily_task_totals(&sessions);
+    let daily_task_totals = build_daily_task_totals(ledger, &sessions);
     let calendar_active_days = daily_task_totals.keys().copied().collect::<HashSet<_>>();
     let day_rows = build_day_rows(app.selected_day, ledger, &sessions);
     let running_rows = build_running_rows(ledger, &sessions, now);
@@ -2246,7 +2246,7 @@ fn build_day_rows(
     ledger: &Ledger,
     sessions: &[SessionRecord],
 ) -> Vec<DaySessionRow> {
-    let (day_start, day_end) = local_day_bounds_utc(selected_day);
+    let (day_start, day_end) = ledger.day_bounds_utc(selected_day);
 
     let mut rows = sessions
         .iter()
@@ -2334,7 +2334,8 @@ fn build_running_rows(
     rows
 }
 
-fn build_local_daily_task_totals(
+fn build_daily_task_totals(
+    ledger: &Ledger,
     sessions: &[SessionRecord],
 ) -> BTreeMap<NaiveDate, HashMap<String, Duration>> {
     let mut daily_task_totals = BTreeMap::<NaiveDate, HashMap<String, Duration>>::new();
@@ -2344,11 +2345,11 @@ fn build_local_daily_task_totals(
             continue;
         }
 
-        let mut day = session.start.with_timezone(&Local).date_naive();
+        let mut day = ledger.day_for_timestamp(session.start);
         let last_moment = session.stop - Duration::seconds(1);
-        let last_day = last_moment.with_timezone(&Local).date_naive();
+        let last_day = ledger.day_for_timestamp(last_moment);
         while day <= last_day {
-            let (day_start, day_end) = local_day_bounds_utc(day);
+            let (day_start, day_end) = ledger.day_bounds_utc(day);
             let slice_start = if session.start > day_start {
                 session.start
             } else {
@@ -3213,17 +3214,6 @@ fn local_naive_to_utc(naive: chrono::NaiveDateTime) -> Option<DateTime<Utc>> {
     }
 }
 
-fn local_day_bounds_utc(day: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
-    let start_naive = day.and_hms_opt(0, 0, 0).expect("midnight must be valid");
-    let next_day = day.succ_opt().expect("next day should exist");
-    let end_naive = next_day
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight must be valid");
-    let start = local_naive_to_utc(start_naive).expect("local day start should be valid");
-    let end = local_naive_to_utc(end_naive).expect("local day end should be valid");
-    (start, end)
-}
-
 fn local_clock_on_date_to_utc(
     day: NaiveDate,
     hour: u32,
@@ -3617,6 +3607,24 @@ impl Default for App {
 }
 
 impl App {
+    fn new(ledger: &Ledger, now: DateTime<Utc>) -> Self {
+        let today = ledger.day_for_timestamp(now);
+        Self {
+            focus: FocusPane::Explorer,
+            selected_day: today,
+            calendar_month: first_day_of_month(today),
+            day_index: 0,
+            day_field: DayField::Start,
+            day_edit_buffer: String::new(),
+            running_index: 0,
+            explorer_mode: ExplorerMode::Projects,
+            explorer_index: 0,
+            explorer_collapsed_categories: HashSet::new(),
+            mode: InputMode::Normal,
+            status: "Ready".to_string(),
+        }
+    }
+
     fn clamp_selection(&mut self, view: &ViewModel) {
         if view.day_rows.is_empty() {
             self.day_index = 0;
