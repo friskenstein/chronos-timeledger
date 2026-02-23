@@ -206,6 +206,50 @@ impl Ledger {
         Ok(id)
     }
 
+    pub fn delete_task(&mut self, task_id: &str) -> Result<(), String> {
+        let task_index = self
+            .header
+            .tasks
+            .iter()
+            .position(|task| task.id == task_id)
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+
+        let has_events = self.events.iter().any(|event| match &event.kind {
+            EventKind::Start { task_id: id, .. } | EventKind::Stop { task_id: id, .. } => {
+                id == task_id
+            }
+        });
+
+        if has_events {
+            return Err("cannot delete task: it has recorded sessions".to_string());
+        }
+
+        self.header.tasks.remove(task_index);
+        Ok(())
+    }
+
+    pub fn delete_category(&mut self, category_id: &str) -> Result<(), String> {
+        let category_index = self
+            .header
+            .categories
+            .iter()
+            .position(|category| category.id == category_id)
+            .ok_or_else(|| format!("category not found: {category_id}"))?;
+
+        let has_tasks = self
+            .header
+            .tasks
+            .iter()
+            .any(|task| task.category_id.as_deref() == Some(category_id));
+
+        if has_tasks {
+            return Err("cannot delete category: it is used by tasks".to_string());
+        }
+
+        self.header.categories.remove(category_index);
+        Ok(())
+    }
+
     pub fn start_task(
         &mut self,
         task_id: &str,
@@ -488,5 +532,67 @@ mod tests {
         };
         assert_eq!(format_duration(total_for(&task_a)), "01:00:00");
         assert_eq!(format_duration(total_for(&task_b)), "01:00:00");
+    }
+
+    #[test]
+    fn deletes_unused_task() {
+        let mut ledger = Ledger::new();
+        let project = ledger.add_project("Work".to_string(), None);
+        let task_id = ledger
+            .add_task(project, None, "Draft".to_string())
+            .expect("task should be created");
+
+        ledger.delete_task(&task_id).expect("delete should succeed");
+        assert!(ledger.task(&task_id).is_none());
+    }
+
+    #[test]
+    fn refuses_to_delete_task_with_events() {
+        let mut ledger = Ledger::new();
+        let project = ledger.add_project("Work".to_string(), None);
+        let task_id = ledger
+            .add_task(project, None, "Draft".to_string())
+            .expect("task should be created");
+
+        ledger
+            .start_task(
+                &task_id,
+                Utc.with_ymd_and_hms(2026, 1, 2, 9, 0, 0).unwrap(),
+                None,
+            )
+            .expect("start should work");
+
+        let err = ledger
+            .delete_task(&task_id)
+            .expect_err("delete should fail");
+        assert!(err.contains("recorded sessions"));
+        assert!(ledger.task(&task_id).is_some());
+    }
+
+    #[test]
+    fn deletes_unused_category() {
+        let mut ledger = Ledger::new();
+        let category_id = ledger.add_category("Admin".to_string(), None);
+
+        ledger
+            .delete_category(&category_id)
+            .expect("delete should succeed");
+        assert!(ledger.category(&category_id).is_none());
+    }
+
+    #[test]
+    fn refuses_to_delete_category_with_tasks() {
+        let mut ledger = Ledger::new();
+        let project = ledger.add_project("Work".to_string(), None);
+        let category_id = ledger.add_category("Admin".to_string(), None);
+        ledger
+            .add_task(project, Some(category_id.clone()), "Draft".to_string())
+            .expect("task should be created");
+
+        let err = ledger
+            .delete_category(&category_id)
+            .expect_err("delete should fail");
+        assert!(err.contains("used by tasks"));
+        assert!(ledger.category(&category_id).is_some());
     }
 }

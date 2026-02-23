@@ -105,7 +105,7 @@ fn run_event_loop(
 fn draw_dashboard(frame: &mut Frame, app: &App, view: &ViewModel) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(12), Constraint::Length(4)])
+        .constraints([Constraint::Min(12), Constraint::Length(6)])
         .split(frame.area());
 
     let body = Layout::default()
@@ -207,6 +207,7 @@ fn render_calendar_panel(
 fn render_explorer_panel(frame: &mut Frame, area: Rect, app: &App, view: &ViewModel) {
     let title = match &app.explorer_mode {
         ExplorerMode::Projects => Line::from("Explorer: Projects"),
+        ExplorerMode::Categories => Line::from("Explorer: Categories"),
         ExplorerMode::ProjectTasks {
             project_name,
             project_style,
@@ -550,14 +551,14 @@ fn allocate_segment_widths(
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let footer_lines = match &app.mode {
-        InputMode::Normal => vec![
-            Line::from("Tab pane | arrows/hjkl navigate | Enter open/collapse (explorer) | q quit"),
-            Line::from(
-                "space start/stop (day+running+explorer) | d delete interval(day) | o new task | p project | c category | t task | e edit | s session note | g switch ledger",
-            ),
-            Line::from(format!(
-                "{}{}",
-                app.status,
+		InputMode::Normal => vec![
+			Line::from("Tab pane | arrows/hjkl navigate | Enter open/collapse (explorer) | q quit"),
+			Line::from(
+				"space start/stop (day+running+explorer) | d delete (day/explorer) | o new (context) | p projects | c categories | t task | e edit | s session note | g switch ledger",
+			),
+			Line::from(format!(
+				"{}{}",
+				app.status,
                 if app.focus == FocusPane::Day {
                     format!(" | {}", app.day_edit_hint())
                 } else {
@@ -579,6 +580,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                     .map(|option| option.label.as_str())
                     .unwrap_or("(none)")
             )),
+            Line::from(app.status.clone()),
             Line::from("j/k or arrows move | Enter choose | Esc cancel"),
         ],
         InputMode::Edit(edit) => {
@@ -879,15 +881,12 @@ fn handle_normal_key(
     match code {
         KeyCode::Char('q') => true,
         KeyCode::Esc => {
-            if app.focus == FocusPane::Explorer {
-                if let ExplorerMode::ProjectTasks { .. } = app.explorer_mode {
-                    app.explorer_mode = ExplorerMode::Projects;
-                    app.explorer_index = 0;
-                    app.status = "Back to projects".to_string();
-                    return false;
-                }
+            if !matches!(app.explorer_mode, ExplorerMode::Projects) {
+                app.explorer_mode = ExplorerMode::Projects;
+                app.explorer_index = 0;
+                app.status = "Back to projects".to_string();
             }
-            true
+            false
         }
         KeyCode::Tab => {
             app.focus = app
@@ -963,16 +962,22 @@ fn handle_normal_key(
             handle_day_digit_input(app, value, ledger, ledger_path.as_path(), view);
             false
         }
-        KeyCode::Char('p') => {
-            app.mode =
-                InputMode::Prompt(PromptState::new("Project name", PromptKind::AddProjectName));
-            false
-        }
+		KeyCode::Char('p') => {
+			if !matches!(app.explorer_mode, ExplorerMode::Projects) {
+				app.explorer_mode = ExplorerMode::Projects;
+				app.explorer_index = 0;
+				app.focus = FocusPane::Explorer;
+				app.status = "Back to projects".to_string();
+			} else {
+				app.status = "Projects".to_string();
+			}
+			false
+		}
         KeyCode::Char('c') => {
-            app.mode = InputMode::Prompt(PromptState::new(
-                "Category name",
-                PromptKind::AddCategoryName,
-            ));
+            app.explorer_mode = ExplorerMode::Categories;
+            app.explorer_index = 0;
+            app.focus = FocusPane::Explorer;
+            app.status = "Categories".to_string();
             false
         }
         KeyCode::Char('e') => {
@@ -993,14 +998,30 @@ fn handle_normal_key(
             }
             false
         }
-        KeyCode::Char('o') => {
-            if let Some(project_id) = app.selected_project_for_new_task(view) {
-                app.mode = InputMode::Select(build_task_category_select(ledger, project_id));
-            } else {
-                app.status = "Select a project in Explorer first".to_string();
-            }
-            false
-        }
+		KeyCode::Char('o') => {
+			match app.explorer_mode {
+				ExplorerMode::Projects => {
+					app.mode = InputMode::Prompt(PromptState::new(
+						"Project name",
+						PromptKind::AddProjectName,
+					));
+				}
+				ExplorerMode::Categories => {
+					app.mode = InputMode::Prompt(PromptState::new(
+						"Category name",
+						PromptKind::AddCategoryName,
+					));
+				}
+				ExplorerMode::ProjectTasks { .. } => {
+					if let Some(project_id) = app.selected_project_for_new_task(view) {
+						app.mode = InputMode::Select(build_task_category_select(ledger, project_id));
+					} else {
+						app.status = "Select a project in Explorer first".to_string();
+					}
+				}
+			}
+			false
+		}
         KeyCode::Char('g') => {
             match build_ledger_switch_select(ledger_path.as_path()) {
                 Ok(select) => app.mode = InputMode::Select(select),
@@ -1062,21 +1083,55 @@ fn handle_normal_key(
             false
         }
         KeyCode::Char('d') => {
-            if app.focus != FocusPane::Day {
-                app.status = "Focus the Day view to delete an interval".to_string();
+            if app.focus == FocusPane::Day {
+                let Some(row) = view.day_rows.get(app.day_index) else {
+                    app.status = "No selected interval to delete".to_string();
+                    return false;
+                };
+                let Some(start_event_index) = row.start_event_index else {
+                    app.status = "Selected interval cannot be deleted".to_string();
+                    return false;
+                };
+
+                app.mode = InputMode::Select(build_delete_interval_select(row, start_event_index));
                 return false;
             }
 
-            let Some(row) = view.day_rows.get(app.day_index) else {
-                app.status = "No selected interval to delete".to_string();
+            if app.focus != FocusPane::Explorer {
+                app.status = "Focus the Day view or Explorer to delete".to_string();
                 return false;
-            };
-            let Some(start_event_index) = row.start_event_index else {
-                app.status = "Selected interval cannot be deleted".to_string();
-                return false;
-            };
+            }
 
-            app.mode = InputMode::Select(build_delete_interval_select(row, start_event_index));
+            match app.explorer_mode {
+                ExplorerMode::Categories => match app.selected_explorer_row_kind(view) {
+                    Some(ExplorerRowKind::Category { category_id, .. }) => {
+                        let Some(category_id) = category_id else {
+                            app.status =
+                                "Uncategorized entries have no category to delete".to_string();
+                            return false;
+                        };
+                        let category_name = category_label(ledger, &category_id);
+                        app.mode = InputMode::Select(build_delete_category_select(
+                            category_id,
+                            category_name,
+                        ));
+                    }
+                    _ => app.status = "Select a category to delete".to_string(),
+                },
+                ExplorerMode::ProjectTasks { .. } => match app.selected_explorer_row_kind(view) {
+                    Some(ExplorerRowKind::Task { task_id, .. }) => {
+                        let task_title = task_label(ledger, &task_id);
+                        app.mode = InputMode::Select(build_delete_task_select(task_id, task_title));
+                    }
+                    Some(ExplorerRowKind::Category { .. }) => {
+                        app.status = "Use the Categories tab to delete categories".to_string();
+                    }
+                    _ => app.status = "Select a task to delete".to_string(),
+                },
+                ExplorerMode::Projects => {
+                    app.status = "Select a project task to delete".to_string();
+                }
+            }
             false
         }
         KeyCode::Char(' ') => {
@@ -1117,10 +1172,12 @@ fn handle_normal_key(
                         app.explorer_index = 0;
                     }
                     Some(ExplorerRowKind::Category { key, .. }) => {
-                        if app.explorer_collapsed_categories.contains(&key) {
-                            app.explorer_collapsed_categories.remove(&key);
-                        } else {
-                            app.explorer_collapsed_categories.insert(key);
+                        if let ExplorerMode::ProjectTasks { .. } = app.explorer_mode {
+                            if app.explorer_collapsed_categories.contains(&key) {
+                                app.explorer_collapsed_categories.remove(&key);
+                            } else {
+                                app.explorer_collapsed_categories.insert(key);
+                            }
                         }
                     }
                     Some(ExplorerRowKind::Task { .. }) => {
@@ -1731,6 +1788,41 @@ fn submit_select(
                 Ok(SelectOutcome::Done("Delete cancelled".to_string()))
             }
         }
+        SelectKind::DeleteTaskConfirm { task_id, task_title } => {
+            let action = selected_value
+                .as_deref()
+                .ok_or_else(|| "selected action is missing".to_string())?;
+            if action == "delete" {
+                delete_task(
+                    ledger,
+                    ledger_path.as_path(),
+                    task_id.as_str(),
+                    task_title.as_str(),
+                )
+                .map(SelectOutcome::Done)
+            } else {
+                Ok(SelectOutcome::Done("Delete cancelled".to_string()))
+            }
+        }
+        SelectKind::DeleteCategoryConfirm {
+            category_id,
+            category_name,
+        } => {
+            let action = selected_value
+                .as_deref()
+                .ok_or_else(|| "selected action is missing".to_string())?;
+            if action == "delete" {
+                delete_category(
+                    ledger,
+                    ledger_path.as_path(),
+                    category_id.as_str(),
+                    category_name.as_str(),
+                )
+                .map(SelectOutcome::Done)
+            } else {
+                Ok(SelectOutcome::Done("Delete cancelled".to_string()))
+            }
+        }
     }
 }
 
@@ -1977,6 +2069,56 @@ fn build_delete_interval_select(row: &DaySessionRow, start_event_index: usize) -
         options,
     );
     // Default to cancel to prevent accidental deletions.
+    select.selected = 1;
+    select
+}
+
+fn build_delete_task_select(task_id: String, task_title: String) -> SelectState {
+    let title = format!("Delete task? {task_title}");
+    let options = vec![
+        SelectOption::new(
+            "Delete",
+            Some("delete".to_string()),
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ),
+        SelectOption::new("Cancel", Some("cancel".to_string()), Style::default()),
+    ];
+
+    let mut select = SelectState::new(
+        title,
+        SelectKind::DeleteTaskConfirm {
+            task_id,
+            task_title,
+        },
+        options,
+    );
+    select.selected = 1;
+    select
+}
+
+fn build_delete_category_select(category_id: String, category_name: String) -> SelectState {
+    let title = format!("Delete category? {category_name}");
+    let options = vec![
+        SelectOption::new(
+            "Delete",
+            Some("delete".to_string()),
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ),
+        SelectOption::new("Cancel", Some("cancel".to_string()), Style::default()),
+    ];
+
+    let mut select = SelectState::new(
+        title,
+        SelectKind::DeleteCategoryConfirm {
+            category_id,
+            category_name,
+        },
+        options,
+    );
     select.selected = 1;
     select
 }
@@ -2523,6 +2665,42 @@ fn build_explorer_rows(
                 })
                 .collect::<Vec<_>>()
         }
+        ExplorerMode::Categories => {
+            let mut categories = ledger.header.categories.iter().collect::<Vec<_>>();
+            if categories.is_empty() {
+                return vec![ExplorerRow::empty("(no categories)")];
+            }
+
+            categories.sort_by(|left, right| {
+                left.archived
+                    .cmp(&right.archived)
+                    .then_with(|| left.name.cmp(&right.name))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+
+            categories
+                .into_iter()
+                .map(|category| {
+                    let label = if category.archived {
+                        format!("{} [archived]", category.name)
+                    } else {
+                        category.name.clone()
+                    };
+                    let style = if category.archived {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default()
+                    };
+                    ExplorerRow {
+                        line: Line::from(Span::styled(label, style)),
+                        kind: ExplorerRowKind::Category {
+                            key: format!("category:{}", category.id),
+                            category_id: Some(category.id.clone()),
+                        },
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
         ExplorerMode::ProjectTasks {
             project_id,
             project_name: _,
@@ -2707,6 +2885,28 @@ fn delete_interval(
 
     persist(ledger_path, ledger)?;
     Ok(format!("deleted interval: {task_title}"))
+}
+
+fn delete_task(
+    ledger: &mut Ledger,
+    ledger_path: &Path,
+    task_id: &str,
+    task_title: &str,
+) -> Result<String, String> {
+    ledger.delete_task(task_id)?;
+    persist(ledger_path, ledger)?;
+    Ok(format!("deleted task: {task_title}"))
+}
+
+fn delete_category(
+    ledger: &mut Ledger,
+    ledger_path: &Path,
+    category_id: &str,
+    category_name: &str,
+) -> Result<String, String> {
+    ledger.delete_category(category_id)?;
+    persist(ledger_path, ledger)?;
+    Ok(format!("deleted category: {category_name}"))
 }
 
 fn switch_ledger(
@@ -3126,6 +3326,13 @@ fn task_label(ledger: &Ledger, task_id: &str) -> String {
         .unwrap_or_else(|| "Unknown task".to_string())
 }
 
+fn category_label(ledger: &Ledger, category_id: &str) -> String {
+    ledger
+        .category(category_id)
+        .map(|category| category.name.clone())
+        .unwrap_or_else(|| "Unknown category".to_string())
+}
+
 fn task_project_and_title(ledger: &Ledger, task_id: &str) -> (String, String, String) {
     if let Some(task) = ledger.task(task_id) {
         let project = ledger
@@ -3511,6 +3718,14 @@ enum SelectKind {
         stop_event_index: Option<usize>,
         task_title: String,
     },
+    DeleteTaskConfirm {
+        task_id: String,
+        task_title: String,
+    },
+    DeleteCategoryConfirm {
+        category_id: String,
+        category_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3562,6 +3777,7 @@ enum DayField {
 #[derive(Debug, Clone)]
 enum ExplorerMode {
     Projects,
+    Categories,
     ProjectTasks {
         project_id: String,
         project_name: String,
