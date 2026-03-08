@@ -18,7 +18,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 
 use crate::domain::{EventKind, Ledger, LedgerSnapshot, Task, TimeEvent, format_duration};
-use crate::ledgers::{recent_ledgers, remember_ledger};
+use crate::ledgers::{forget_ledger, ledger_path_from_input, recent_ledgers, remember_ledger};
 use crate::storage::{load_ledger, save_ledger};
 
 const TERMINAL_COLORS: [&str; 16] = [
@@ -555,7 +555,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         InputMode::Normal => vec![
             Line::from("Tab pane | arrows/hjkl navigate | Enter open/collapse (explorer) | q quit"),
             Line::from(
-                "space stop or start dialog (day+running+explorer) | d delete (day/explorer) | o new (context) | p projects | c categories | t task | e edit (day/explorer) | s session note (running/explorer) | g switch ledger",
+                "space stop or start dialog (day+running+explorer) | d delete (day/explorer) | o new (context) | p projects | c categories | t task | e edit (day/explorer) | s session note (running/explorer) | g ledgers",
             ),
             Line::from(format!(
                 "{}{}",
@@ -1036,7 +1036,7 @@ fn handle_normal_key(
             false
         }
         KeyCode::Char('g') => {
-            match build_ledger_switch_select(ledger_path.as_path()) {
+            match build_ledger_management_select(ledger_path.as_path()) {
                 Ok(select) => app.mode = InputMode::Select(select),
                 Err(err) => app.status = err,
             }
@@ -1464,7 +1464,7 @@ fn handle_prompt_key(
             }
         }
         KeyCode::Char('\n') | KeyCode::Char('\r') => {
-            submit_active_prompt(app, ledger, ledger_path.as_path());
+            submit_active_prompt(app, ledger, ledger_path);
         }
         KeyCode::Char(value) => {
             if let InputMode::Prompt(prompt) = &mut app.mode {
@@ -1472,7 +1472,7 @@ fn handle_prompt_key(
             }
         }
         KeyCode::Enter => {
-            submit_active_prompt(app, ledger, ledger_path.as_path());
+            submit_active_prompt(app, ledger, ledger_path);
         }
         _ => {}
     }
@@ -1480,7 +1480,7 @@ fn handle_prompt_key(
     false
 }
 
-fn submit_active_prompt(app: &mut App, ledger: &mut Ledger, ledger_path: &Path) {
+fn submit_active_prompt(app: &mut App, ledger: &mut Ledger, ledger_path: &mut PathBuf) {
     let prompt = match std::mem::replace(&mut app.mode, InputMode::Normal) {
         InputMode::Prompt(prompt) => prompt,
         InputMode::Normal | InputMode::Select(_) | InputMode::Edit(_) => return,
@@ -1489,6 +1489,9 @@ fn submit_active_prompt(app: &mut App, ledger: &mut Ledger, ledger_path: &Path) 
     match submit_prompt(prompt.clone(), ledger, ledger_path) {
         Ok(PromptOutcome::NextPrompt(next_prompt)) => app.mode = InputMode::Prompt(next_prompt),
         Ok(PromptOutcome::Select(select)) => app.mode = InputMode::Select(select),
+        Ok(PromptOutcome::Reload(message)) => {
+            app.reset_for_ledger(ledger, Utc::now(), message);
+        }
         Ok(PromptOutcome::Done(message)) => {
             app.mode = InputMode::Normal;
             app.status = message;
@@ -1546,6 +1549,9 @@ fn handle_select_key(
                 }
                 Ok(SelectOutcome::NextEdit(edit)) => {
                     app.mode = InputMode::Edit(edit);
+                }
+                Ok(SelectOutcome::Reload(message)) => {
+                    app.reset_for_ledger(ledger, Utc::now(), message);
                 }
                 Ok(SelectOutcome::Done(message)) => {
                     app.mode = InputMode::Normal;
@@ -1765,7 +1771,7 @@ fn handle_edit_key(
 fn submit_prompt(
     prompt: PromptState,
     ledger: &mut Ledger,
-    ledger_path: &Path,
+    ledger_path: &mut PathBuf,
 ) -> Result<PromptOutcome, String> {
     match prompt.kind {
         PromptKind::AddProjectName => {
@@ -1783,7 +1789,7 @@ fn submit_prompt(
             let description = optional_text(&prompt.input);
             let created_name = name.clone();
             ledger.add_category(name, description);
-            persist(ledger_path, ledger)?;
+            persist(ledger_path.as_path(), ledger)?;
             Ok(PromptOutcome::Done(format!(
                 "created category: {created_name}"
             )))
@@ -1799,7 +1805,7 @@ fn submit_prompt(
                 .unwrap_or("(no description)")
                 .to_string();
             ledger.add_task(project_id, category_id, description)?;
-            persist(ledger_path, ledger)?;
+            persist(ledger_path.as_path(), ledger)?;
             Ok(PromptOutcome::Done(format!("created task: {task_label}")))
         }
         PromptKind::StartTaskNote { mut flow } => {
@@ -1812,8 +1818,14 @@ fn submit_prompt(
             let timestamp =
                 parse_time_input_on_day(&prompt.input, flow.selected_day, "start time")?;
             validate_start_timestamp(timestamp, Utc::now())?;
-            start_task_at(ledger, ledger_path, &flow.task_id, timestamp, flow.note)
-                .map(PromptOutcome::Done)
+            start_task_at(
+                ledger,
+                ledger_path.as_path(),
+                &flow.task_id,
+                timestamp,
+                flow.note,
+            )
+            .map(PromptOutcome::Done)
         }
         PromptKind::StartTaskCustomIntervalStart { flow } => {
             let timestamp =
@@ -1839,7 +1851,7 @@ fn submit_prompt(
             validate_interval_bounds(start_timestamp, end_timestamp, Utc::now())?;
             log_task_interval(
                 ledger,
-                ledger_path,
+                ledger_path.as_path(),
                 &flow.task_id,
                 start_timestamp,
                 end_timestamp,
@@ -1865,10 +1877,14 @@ fn submit_prompt(
                     return Err("selected event is not a start event".to_string());
                 }
             }
-            persist(ledger_path, ledger)?;
+            persist(ledger_path.as_path(), ledger)?;
             Ok(PromptOutcome::Done(format!(
                 "updated session note: {task_title}"
             )))
+        }
+        PromptKind::LedgerPath => {
+            let selected_path = ledger_path_from_input(&prompt.input)?;
+            open_or_create_ledger(ledger, ledger_path, selected_path).map(PromptOutcome::Reload)
         }
     }
 }
@@ -1929,11 +1945,35 @@ fn submit_select(
                 _ => Err(format!("unknown start action: {action}")),
             }
         }
+        SelectKind::LedgerAction { current_path } => {
+            let action =
+                selected_value.ok_or_else(|| "selected ledger action is missing".to_string())?;
+            match action.as_str() {
+                "open_create" => Ok(SelectOutcome::NextPrompt(PromptState::new(
+                    "Ledger path (open existing or create new)",
+                    PromptKind::LedgerPath,
+                ))),
+                "switch" => Ok(SelectOutcome::NextSelect(build_ledger_switch_select(
+                    current_path.as_path(),
+                )?)),
+                "forget" => Ok(SelectOutcome::NextSelect(build_ledger_forget_select(
+                    current_path.as_path(),
+                )?)),
+                _ => Err(format!("unknown ledger action: {action}")),
+            }
+        }
         SelectKind::LedgerSwitch => {
             let selected_path = selected_value
                 .map(PathBuf::from)
                 .ok_or_else(|| "selected ledger path is missing".to_string())?;
-            switch_ledger(ledger, ledger_path, selected_path).map(SelectOutcome::Done)
+            switch_ledger(ledger, ledger_path, selected_path).map(SelectOutcome::Reload)
+        }
+        SelectKind::LedgerForget => {
+            let selected_path = selected_value
+                .map(PathBuf::from)
+                .ok_or_else(|| "selected ledger path is missing".to_string())?;
+            forget_recent_ledger(selected_path.as_path(), ledger_path.as_path())
+                .map(SelectOutcome::Done)
         }
         SelectKind::IntervalTask { mut edit } => {
             let task_id = selected_value.ok_or_else(|| "selected task is missing".to_string())?;
@@ -2266,6 +2306,37 @@ fn build_task_category_select(ledger: &Ledger, project_id: String) -> SelectStat
     )
 }
 
+fn build_ledger_management_select(current_path: &Path) -> Result<SelectState, String> {
+    let recent_count = recent_ledgers(100)
+        .map_err(|err| format!("failed to load recent ledgers: {err}"))?
+        .len();
+    let mut options = vec![SelectOption::new(
+        "Open or create by path",
+        Some("open_create".to_string()),
+        Style::default(),
+    )];
+    if recent_count > 0 {
+        options.push(SelectOption::new(
+            format!("Switch recent ledger ({recent_count})"),
+            Some("switch".to_string()),
+            Style::default(),
+        ));
+        options.push(SelectOption::new(
+            format!("Forget recent ledger ({recent_count})"),
+            Some("forget".to_string()),
+            Style::default(),
+        ));
+    }
+
+    Ok(SelectState::new(
+        "Ledger",
+        SelectKind::LedgerAction {
+            current_path: current_path.to_path_buf(),
+        },
+        options,
+    ))
+}
+
 fn build_ledger_switch_select(current_path: &Path) -> Result<SelectState, String> {
     let mut paths =
         recent_ledgers(100).map_err(|err| format!("failed to load recent ledgers: {err}"))?;
@@ -2279,7 +2350,33 @@ fn build_ledger_switch_select(current_path: &Path) -> Result<SelectState, String
     }
 
     let current_value = current_path.display().to_string();
-    let options = paths
+    let options = build_recent_ledger_options(paths, current_value.as_str());
+
+    let mut select = SelectState::new("Switch ledger", SelectKind::LedgerSwitch, options);
+    select.selected = select
+        .options
+        .iter()
+        .position(|option| option.value.as_deref() == Some(current_value.as_str()))
+        .unwrap_or(0);
+    Ok(select)
+}
+
+fn build_ledger_forget_select(current_path: &Path) -> Result<SelectState, String> {
+    let paths =
+        recent_ledgers(100).map_err(|err| format!("failed to load recent ledgers: {err}"))?;
+    if paths.is_empty() {
+        return Err("no recent ledgers to forget".to_string());
+    }
+
+    Ok(SelectState::new(
+        "Forget recent ledger",
+        SelectKind::LedgerForget,
+        build_recent_ledger_options(paths, current_path.display().to_string().as_str()),
+    ))
+}
+
+fn build_recent_ledger_options(paths: Vec<PathBuf>, current_value: &str) -> Vec<SelectOption> {
+    paths
         .into_iter()
         .map(|path| {
             let value = path.display().to_string();
@@ -2305,15 +2402,7 @@ fn build_ledger_switch_select(current_path: &Path) -> Result<SelectState, String
 
             SelectOption::new(label, Some(value), style)
         })
-        .collect::<Vec<_>>();
-
-    let mut select = SelectState::new("Switch ledger", SelectKind::LedgerSwitch, options);
-    select.selected = select
-        .options
-        .iter()
-        .position(|option| option.value.as_deref() == Some(current_value.as_str()))
-        .unwrap_or(0);
-    Ok(select)
+        .collect()
 }
 
 fn build_delete_interval_select(row: &DaySessionRow, start_event_index: usize) -> SelectState {
@@ -3385,6 +3474,49 @@ fn switch_ledger(
     }
 }
 
+fn open_or_create_ledger(
+    ledger: &mut Ledger,
+    ledger_path: &mut PathBuf,
+    next_path: PathBuf,
+) -> Result<String, String> {
+    if &next_path == ledger_path && next_path.exists() {
+        return Ok(format!("already using ledger: {}", ledger_path.display()));
+    }
+
+    let (next_ledger, action) = if next_path.exists() {
+        (
+            load_ledger(&next_path).map_err(|err| err.to_string())?,
+            "opened",
+        )
+    } else {
+        let next_ledger = Ledger::new();
+        persist(&next_path, &next_ledger)?;
+        (next_ledger, "created")
+    };
+
+    *ledger = next_ledger;
+    *ledger_path = next_path;
+
+    match remember_ledger(ledger_path.as_path()) {
+        Ok(()) => Ok(format!("{action} ledger: {}", ledger_path.display())),
+        Err(err) => Ok(format!(
+            "{action} ledger: {} (warning: failed to store recents: {err})",
+            ledger_path.display()
+        )),
+    }
+}
+
+fn forget_recent_ledger(path: &Path, current_path: &Path) -> Result<String, String> {
+    match forget_ledger(path).map_err(|err| err.to_string())? {
+        true if path == current_path => Ok(format!(
+            "forgot current ledger from recents: {}",
+            path.display()
+        )),
+        true => Ok(format!("forgot ledger from recents: {}", path.display())),
+        false => Ok(format!("ledger was not in recents: {}", path.display())),
+    }
+}
+
 fn persist(path: &Path, ledger: &Ledger) -> Result<(), String> {
     save_ledger(path, ledger).map_err(|err| err.to_string())
 }
@@ -4009,6 +4141,7 @@ fn explorer_category_key(project_id: &str, category_id: Option<&str>) -> String 
 enum PromptOutcome {
     NextPrompt(PromptState),
     Select(SelectState),
+    Reload(String),
     Done(String),
 }
 
@@ -4017,6 +4150,7 @@ enum SelectOutcome {
     NextPrompt(PromptState),
     NextSelect(SelectState),
     NextEdit(EditState),
+    Reload(String),
     Done(String),
 }
 
@@ -4265,10 +4399,14 @@ enum PromptKind {
         event_index: usize,
         task_title: String,
     },
+    LedgerPath,
 }
 
 #[derive(Debug, Clone)]
 enum SelectKind {
+    LedgerAction {
+        current_path: PathBuf,
+    },
     ProjectColor {
         name: String,
     },
@@ -4280,6 +4418,7 @@ enum SelectKind {
         flow: StartTaskFlow,
     },
     LedgerSwitch,
+    LedgerForget,
     IntervalTask {
         edit: EditState,
     },
@@ -4416,6 +4555,12 @@ impl App {
             mode: InputMode::Normal,
             status: "Ready".to_string(),
         }
+    }
+
+    fn reset_for_ledger(&mut self, ledger: &Ledger, now: DateTime<Utc>, status: String) {
+        let mut next = Self::new(ledger, now);
+        next.status = status;
+        *self = next;
     }
 
     fn clamp_selection(&mut self, view: &ViewModel) {

@@ -39,6 +39,29 @@ pub fn remember_ledger(path: &Path) -> Result<(), std::io::Error> {
     save_recent_ledgers(&entries)
 }
 
+pub fn forget_ledger(path: &Path) -> Result<bool, std::io::Error> {
+    let path = absolutize(path.to_path_buf());
+    let mut entries = recent_ledgers(MAX_RECENT_LEDGERS)?;
+    let original_len = entries.len();
+    entries.retain(|entry| entry != &path);
+    if entries.len() == original_len {
+        return Ok(false);
+    }
+
+    save_recent_ledgers(&entries)?;
+    Ok(true)
+}
+
+pub fn ledger_path_from_input(input: &str) -> Result<PathBuf, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("ledger path is required".to_string());
+    }
+
+    let path = expand_home_path(trimmed)?;
+    Ok(absolutize(path))
+}
+
 pub fn recent_ledgers(limit: usize) -> Result<Vec<PathBuf>, std::io::Error> {
     let path = recent_ledgers_path();
     let raw = match fs::read_to_string(path) {
@@ -102,6 +125,36 @@ fn state_dir() -> PathBuf {
     }
 
     PathBuf::from(".chronos_timeledger")
+}
+
+fn expand_home_path(input: &str) -> Result<PathBuf, String> {
+    if input == "~" {
+        return home_dir();
+    }
+
+    if let Some(rest) = input
+        .strip_prefix("~/")
+        .or_else(|| input.strip_prefix("~\\"))
+    {
+        return Ok(home_dir()?.join(rest));
+    }
+
+    Ok(PathBuf::from(input))
+}
+
+fn home_dir() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os("HOME") {
+        return Ok(PathBuf::from(path));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(path) = env::var_os("USERPROFILE") {
+            return Ok(PathBuf::from(path));
+        }
+    }
+
+    Err("cannot expand `~` because the home directory is unknown".to_string())
 }
 
 fn absolutize(path: PathBuf) -> PathBuf {
