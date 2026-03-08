@@ -1,0 +1,40 @@
+schema_version = 1
+created_at = "2026-03-08T09:00:00Z"
+day_start_offset_hours = 4
+
+[[projects]]
+id = "Ab12Cd34"
+name = "Client Work"
+color = "light_cyan"
+archived = false
+
+[[projects]]
+id = "Ef56Gh78"
+name = "Personal"
+color = "light_green"
+archived = false
+
+[[tasks]]
+id = "Tsk12345"
+project_id = "Ab12Cd34"
+description = "Ship the shared ledger contract"
+archived = false
+
+[[tasks]]
+id = "Run67890"
+project_id = "Ef56Gh78"
+category_id = "Cat12345"
+description = "Morning run"
+archived = false
+
+[[categories]]
+id = "Cat12345"
+name = "Health"
+description = "Personal wellness tasks"
+archived = false
+
+=== EVENTS ===
+{"timestamp":"2026-03-08T09:15:00Z","type":"start","task_id":"Tsk12345","note":"Schema pass"}
+{"timestamp":"2026-03-08T10:00:00Z","type":"stop","task_id":"Tsk12345","note":null}
+{"timestamp":"2026-03-08T06:30:00Z","type":"start","task_id":"Run67890","note":"Intervals"}
+{"timestamp":"2026-03-08T07:10:00Z","type":"stop","task_id":"Run67890","note":null}

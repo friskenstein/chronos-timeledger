@@ -1,0 +1,8 @@
+{
+	"name": "contract-tests",
+	"version": "0.1.0",
+	"private": true,
+	"scripts": {
+		"validate": "node -e \"console.log('contract validation tooling not installed yet')\""
+	}
+}

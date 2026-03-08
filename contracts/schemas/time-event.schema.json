@@ -1,0 +1,77 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://chronos-timeledger/contracts/schemas/time-event.schema.json",
+	"title": "Chronos Time Event",
+	"oneOf": [
+		{
+			"$ref": "#/$defs/startEvent"
+		},
+		{
+			"$ref": "#/$defs/stopEvent"
+		}
+	],
+	"$defs": {
+		"id": {
+			"type": "string",
+			"pattern": "^[A-Za-z0-9]{8}$"
+		},
+		"baseEvent": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": [
+				"timestamp",
+				"type",
+				"task_id",
+				"note"
+			],
+			"properties": {
+				"timestamp": {
+					"type": "string",
+					"format": "date-time"
+				},
+				"type": {
+					"type": "string"
+				},
+				"task_id": {
+					"$ref": "#/$defs/id"
+				},
+				"note": {
+					"type": [
+						"string",
+						"null"
+					]
+				}
+			}
+		},
+		"startEvent": {
+			"allOf": [
+				{
+					"$ref": "#/$defs/baseEvent"
+				},
+				{
+					"type": "object",
+					"properties": {
+						"type": {
+							"const": "start"
+						}
+					}
+				}
+			]
+		},
+		"stopEvent": {
+			"allOf": [
+				{
+					"$ref": "#/$defs/baseEvent"
+				},
+				{
+					"type": "object",
+					"properties": {
+						"type": {
+							"const": "stop"
+						}
+					}
+				}
+			]
+		}
+	}
+}

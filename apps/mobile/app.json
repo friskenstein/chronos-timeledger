@@ -1,0 +1,9 @@
+{
+	"expo": {
+		"name": "Chronos Timeledger",
+		"slug": "chronos-timeledger",
+		"version": "0.1.0",
+		"orientation": "portrait",
+		"userInterfaceStyle": "automatic"
+	}
+}

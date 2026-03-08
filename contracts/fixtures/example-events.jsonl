@@ -1,0 +1,4 @@
+{"timestamp":"2026-03-08T09:15:00Z","type":"start","task_id":"Tsk12345","note":"Schema pass"}
+{"timestamp":"2026-03-08T10:00:00Z","type":"stop","task_id":"Tsk12345","note":null}
+{"timestamp":"2026-03-08T06:30:00Z","type":"start","task_id":"Run67890","note":"Intervals"}
+{"timestamp":"2026-03-08T07:10:00Z","type":"stop","task_id":"Run67890","note":null}

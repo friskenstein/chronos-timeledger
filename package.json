@@ -1,0 +1,13 @@
+{
+	"name": "chronos_timeledger",
+	"private": true,
+	"workspaces": [
+		"apps/mobile",
+		"tools/*"
+	],
+	"scripts": {
+		"mobile:start": "npm --workspace apps/mobile run start",
+		"mobile:typecheck": "npm --workspace apps/mobile run typecheck",
+		"tui:check": "cargo check --manifest-path apps/tui/Cargo.toml"
+	}
+}
