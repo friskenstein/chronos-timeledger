@@ -390,12 +390,7 @@ fn accumulate_session(
         let slice_end = if stop < day_end { stop } else { day_end };
 
         if slice_end > slice_start {
-            add_daily_total(
-                daily_task_totals,
-                day,
-                task_id,
-                slice_end - slice_start,
-            );
+            add_daily_total(daily_task_totals, day, task_id, slice_end - slice_start);
         }
 
         day = day.succ_opt().expect("next day should exist");
@@ -423,10 +418,7 @@ fn ledger_day_bounds_utc(
     day: NaiveDate,
     day_start_offset: Duration,
 ) -> (DateTime<Utc>, DateTime<Utc>) {
-    let start_naive = day
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight must be valid")
-        + day_start_offset;
+    let start_naive = day.and_hms_opt(0, 0, 0).expect("midnight must be valid") + day_start_offset;
     let end_naive = start_naive + Duration::days(1);
     let start = local_naive_to_utc_resolved(start_naive);
     let end = local_naive_to_utc_resolved(end_naive);

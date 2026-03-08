@@ -306,7 +306,8 @@ fn render_running_panel(frame: &mut Frame, area: Rect, app: &App, view: &ViewMod
     let mut state = ListState::default();
     if !view.running_rows.is_empty() {
         state.select(Some(
-            app.running_index.min(view.running_rows.len().saturating_sub(1)),
+            app.running_index
+                .min(view.running_rows.len().saturating_sub(1)),
         ));
     }
 
@@ -551,14 +552,14 @@ fn allocate_segment_widths(
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let footer_lines = match &app.mode {
-		InputMode::Normal => vec![
-			Line::from("Tab pane | arrows/hjkl navigate | Enter open/collapse (explorer) | q quit"),
-			Line::from(
-				"space start/stop (day+running+explorer) | d delete (day/explorer) | o new (context) | p projects | c categories | t task | e edit | s session note | g switch ledger",
-			),
-			Line::from(format!(
-				"{}{}",
-				app.status,
+        InputMode::Normal => vec![
+            Line::from("Tab pane | arrows/hjkl navigate | Enter open/collapse (explorer) | q quit"),
+            Line::from(
+                "space stop or start dialog (day+running+explorer) | d delete (day/explorer) | o new (context) | p projects | c categories | t task | e edit (day/explorer) | s session note (running/explorer) | g switch ledger",
+            ),
+            Line::from(format!(
+                "{}{}",
+                app.status,
                 if app.focus == FocusPane::Day {
                     format!(" | {}", app.day_edit_hint())
                 } else {
@@ -889,16 +890,12 @@ fn handle_normal_key(
             false
         }
         KeyCode::Tab => {
-            app.focus = app
-                .focus
-                .next(!view.running_rows.is_empty());
+            app.focus = app.focus.next(!view.running_rows.is_empty());
             app.clear_day_edit_buffer();
             false
         }
         KeyCode::BackTab => {
-            app.focus = app
-                .focus
-                .prev(!view.running_rows.is_empty());
+            app.focus = app.focus.prev(!view.running_rows.is_empty());
             app.clear_day_edit_buffer();
             false
         }
@@ -962,17 +959,17 @@ fn handle_normal_key(
             handle_day_digit_input(app, value, ledger, ledger_path.as_path(), view);
             false
         }
-		KeyCode::Char('p') => {
-			if !matches!(app.explorer_mode, ExplorerMode::Projects) {
-				app.explorer_mode = ExplorerMode::Projects;
-				app.explorer_index = 0;
-				app.focus = FocusPane::Explorer;
-				app.status = "Back to projects".to_string();
-			} else {
-				app.status = "Projects".to_string();
-			}
-			false
-		}
+        KeyCode::Char('p') => {
+            if !matches!(app.explorer_mode, ExplorerMode::Projects) {
+                app.explorer_mode = ExplorerMode::Projects;
+                app.explorer_index = 0;
+                app.focus = FocusPane::Explorer;
+                app.status = "Back to projects".to_string();
+            } else {
+                app.status = "Projects".to_string();
+            }
+            false
+        }
         KeyCode::Char('c') => {
             app.explorer_mode = ExplorerMode::Categories;
             app.explorer_index = 0;
@@ -981,13 +978,28 @@ fn handle_normal_key(
             false
         }
         KeyCode::Char('e') => {
-            if app.focus != FocusPane::Explorer {
-                app.status = "Focus the Explorer to edit items".to_string();
-                return false;
-            }
-            match build_edit_state_for_explorer(app, ledger, view) {
-                Ok(edit_state) => app.mode = InputMode::Edit(edit_state),
-                Err(err) => app.status = err,
+            match app.focus {
+                FocusPane::Day => {
+                    let Some(row) = view.day_rows.get(app.day_index) else {
+                        app.status = "No selected interval in day view".to_string();
+                        return false;
+                    };
+                    let Some(start_event_index) = row.start_event_index else {
+                        app.status = "Selected interval cannot be edited".to_string();
+                        return false;
+                    };
+                    match build_interval_edit_state(ledger, row, start_event_index) {
+                        Ok(edit_state) => app.mode = InputMode::Edit(edit_state),
+                        Err(err) => app.status = err,
+                    }
+                }
+                FocusPane::Explorer => match build_edit_state_for_explorer(app, ledger, view) {
+                    Ok(edit_state) => app.mode = InputMode::Edit(edit_state),
+                    Err(err) => app.status = err,
+                },
+                _ => {
+                    app.status = "Focus the Day view or Explorer to edit".to_string();
+                }
             }
             false
         }
@@ -998,30 +1010,31 @@ fn handle_normal_key(
             }
             false
         }
-		KeyCode::Char('o') => {
-			match app.explorer_mode {
-				ExplorerMode::Projects => {
-					app.mode = InputMode::Prompt(PromptState::new(
-						"Project name",
-						PromptKind::AddProjectName,
-					));
-				}
-				ExplorerMode::Categories => {
-					app.mode = InputMode::Prompt(PromptState::new(
-						"Category name",
-						PromptKind::AddCategoryName,
-					));
-				}
-				ExplorerMode::ProjectTasks { .. } => {
-					if let Some(project_id) = app.selected_project_for_new_task(view) {
-						app.mode = InputMode::Select(build_task_category_select(ledger, project_id));
-					} else {
-						app.status = "Select a project in Explorer first".to_string();
-					}
-				}
-			}
-			false
-		}
+        KeyCode::Char('o') => {
+            match app.explorer_mode {
+                ExplorerMode::Projects => {
+                    app.mode = InputMode::Prompt(PromptState::new(
+                        "Project name",
+                        PromptKind::AddProjectName,
+                    ));
+                }
+                ExplorerMode::Categories => {
+                    app.mode = InputMode::Prompt(PromptState::new(
+                        "Category name",
+                        PromptKind::AddCategoryName,
+                    ));
+                }
+                ExplorerMode::ProjectTasks { .. } => {
+                    if let Some(project_id) = app.selected_project_for_new_task(view) {
+                        app.mode =
+                            InputMode::Select(build_task_category_select(ledger, project_id));
+                    } else {
+                        app.status = "Select a project in Explorer first".to_string();
+                    }
+                }
+            }
+            false
+        }
         KeyCode::Char('g') => {
             match build_ledger_switch_select(ledger_path.as_path()) {
                 Ok(select) => app.mode = InputMode::Select(select),
@@ -1032,23 +1045,7 @@ fn handle_normal_key(
         KeyCode::Char('s') => {
             match app.focus {
                 FocusPane::Day => {
-                    let Some(row) = view.day_rows.get(app.day_index) else {
-                        app.status = "No selected interval in day view".to_string();
-                        return false;
-                    };
-                    let Some(event_index) = row.start_event_index else {
-                        app.status = "Selected interval has no editable session note".to_string();
-                        return false;
-                    };
-
-                    if let Err(err) = open_start_note_prompt(
-                        app,
-                        ledger,
-                        event_index,
-                        row.task_title.clone(),
-                    ) {
-                        app.status = err;
-                    }
+                    app.status = "Use e to edit session notes in Day view".to_string();
                 }
                 FocusPane::Running => {
                     let Some(row) = view.running_rows.get(app.running_index) else {
@@ -1060,12 +1057,9 @@ fn handle_normal_key(
                         return false;
                     };
 
-                    if let Err(err) = open_start_note_prompt(
-                        app,
-                        ledger,
-                        event_index,
-                        row.task_title.clone(),
-                    ) {
+                    if let Err(err) =
+                        open_start_note_prompt(app, ledger, event_index, row.task_title.clone())
+                    {
                         app.status = err;
                     }
                 }
@@ -1073,7 +1067,9 @@ fn handle_normal_key(
                     if let Some(task_id) = app.selected_task_id(view) {
                         app.mode = InputMode::Prompt(PromptState::new(
                             "Session note (optional)",
-                            PromptKind::StartTaskNote { task_id },
+                            PromptKind::StartTaskNote {
+                                flow: StartTaskFlow::new(task_id, app.selected_day, None),
+                            },
                         ));
                     } else {
                         app.status = "Select a task first".to_string();
@@ -1139,7 +1135,11 @@ fn handle_normal_key(
                 let result = if snapshot.active_tasks.contains_key(&task_id) {
                     stop_task(ledger, ledger_path.as_path(), &task_id, None)
                 } else {
-                    start_task(ledger, ledger_path.as_path(), &task_id, None)
+                    app.mode = InputMode::Select(build_start_task_timing_select(
+                        ledger,
+                        StartTaskFlow::new(task_id, app.selected_day, None),
+                    ));
+                    return false;
                 };
                 app.status = match result {
                     Ok(message) => message,
@@ -1508,8 +1508,20 @@ fn handle_select_key(
 ) -> bool {
     match code {
         KeyCode::Esc => {
-            app.mode = InputMode::Normal;
-            app.status = "Selection cancelled".to_string();
+            let select = match std::mem::replace(&mut app.mode, InputMode::Normal) {
+                InputMode::Select(select) => select,
+                _ => return false,
+            };
+            match select.kind {
+                SelectKind::IntervalTask { edit } => {
+                    app.mode = InputMode::Edit(edit);
+                    app.status = "Selection cancelled".to_string();
+                }
+                _ => {
+                    app.mode = InputMode::Normal;
+                    app.status = "Selection cancelled".to_string();
+                }
+            }
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let InputMode::Select(select) = &mut app.mode {
@@ -1531,6 +1543,9 @@ fn handle_select_key(
                 Ok(SelectOutcome::NextPrompt(prompt)) => app.mode = InputMode::Prompt(prompt),
                 Ok(SelectOutcome::NextSelect(next_select)) => {
                     app.mode = InputMode::Select(next_select)
+                }
+                Ok(SelectOutcome::NextEdit(edit)) => {
+                    app.mode = InputMode::Edit(edit);
                 }
                 Ok(SelectOutcome::Done(message)) => {
                     app.mode = InputMode::Normal;
@@ -1556,6 +1571,8 @@ fn handle_edit_key(
 ) -> bool {
     let mut cancel_edit = false;
     let mut save_result: Option<Result<String, String>> = None;
+    let mut next_mode: Option<InputMode> = None;
+    let mut status_message: Option<String> = None;
 
     {
         let InputMode::Edit(edit) = &mut app.mode else {
@@ -1618,16 +1635,96 @@ fn handle_edit_key(
                     edit.move_selection(1);
                 }
                 KeyCode::Left | KeyCode::Char('h') => {
-                    cycle_edit_field(edit, -1);
+                    if matches!(edit.entity, EditEntity::Interval { .. })
+                        && matches!(
+                            edit.fields.get(edit.selected).map(|field| field.id),
+                            Some(EditFieldId::Task)
+                        )
+                    {
+                        match build_interval_task_select(ledger, edit) {
+                            Ok(select) => next_mode = Some(InputMode::Select(select)),
+                            Err(err) => status_message = Some(err),
+                        }
+                    } else {
+                        cycle_edit_field(edit, -1);
+                        if matches!(edit.entity, EditEntity::Interval { .. })
+                            && matches!(
+                                edit.fields.get(edit.selected).map(|field| field.id),
+                                Some(EditFieldId::Project)
+                            )
+                        {
+                            refresh_interval_task_options(edit, ledger);
+                        }
+                    }
                 }
                 KeyCode::Right | KeyCode::Char('l') => {
-                    cycle_edit_field(edit, 1);
+                    if matches!(edit.entity, EditEntity::Interval { .. })
+                        && matches!(
+                            edit.fields.get(edit.selected).map(|field| field.id),
+                            Some(EditFieldId::Task)
+                        )
+                    {
+                        match build_interval_task_select(ledger, edit) {
+                            Ok(select) => next_mode = Some(InputMode::Select(select)),
+                            Err(err) => status_message = Some(err),
+                        }
+                    } else {
+                        cycle_edit_field(edit, 1);
+                        if matches!(edit.entity, EditEntity::Interval { .. })
+                            && matches!(
+                                edit.fields.get(edit.selected).map(|field| field.id),
+                                Some(EditFieldId::Project)
+                            )
+                        {
+                            refresh_interval_task_options(edit, ledger);
+                        }
+                    }
                 }
                 KeyCode::Enter => {
-                    activate_edit_field(edit);
+                    if matches!(edit.entity, EditEntity::Interval { .. })
+                        && matches!(
+                            edit.fields.get(edit.selected).map(|field| field.id),
+                            Some(EditFieldId::Task)
+                        )
+                    {
+                        match build_interval_task_select(ledger, edit) {
+                            Ok(select) => next_mode = Some(InputMode::Select(select)),
+                            Err(err) => status_message = Some(err),
+                        }
+                    } else {
+                        activate_edit_field(edit);
+                        if matches!(edit.entity, EditEntity::Interval { .. })
+                            && matches!(
+                                edit.fields.get(edit.selected).map(|field| field.id),
+                                Some(EditFieldId::Project)
+                            )
+                        {
+                            refresh_interval_task_options(edit, ledger);
+                        }
+                    }
                 }
                 KeyCode::Char(' ') => {
-                    cycle_edit_field(edit, 1);
+                    if matches!(edit.entity, EditEntity::Interval { .. })
+                        && matches!(
+                            edit.fields.get(edit.selected).map(|field| field.id),
+                            Some(EditFieldId::Task)
+                        )
+                    {
+                        match build_interval_task_select(ledger, edit) {
+                            Ok(select) => next_mode = Some(InputMode::Select(select)),
+                            Err(err) => status_message = Some(err),
+                        }
+                    } else {
+                        cycle_edit_field(edit, 1);
+                        if matches!(edit.entity, EditEntity::Interval { .. })
+                            && matches!(
+                                edit.fields.get(edit.selected).map(|field| field.id),
+                                Some(EditFieldId::Project)
+                            )
+                        {
+                            refresh_interval_task_options(edit, ledger);
+                        }
+                    }
                 }
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     save_result = Some(submit_edit(edit, ledger, ledger_path.as_path()));
@@ -1641,6 +1738,13 @@ fn handle_edit_key(
         app.mode = InputMode::Normal;
         app.status = "Edit cancelled".to_string();
         return false;
+    }
+
+    if let Some(mode) = next_mode {
+        app.mode = mode;
+    }
+    if let Some(message) = status_message {
+        app.status = message;
     }
 
     if let Some(result) = save_result {
@@ -1698,9 +1802,50 @@ fn submit_prompt(
             persist(ledger_path, ledger)?;
             Ok(PromptOutcome::Done(format!("created task: {task_label}")))
         }
-        PromptKind::StartTaskNote { task_id } => {
-            let note = optional_text(&prompt.input);
-            start_task(ledger, ledger_path, &task_id, note).map(PromptOutcome::Done)
+        PromptKind::StartTaskNote { mut flow } => {
+            flow.note = optional_text(&prompt.input);
+            Ok(PromptOutcome::Select(build_start_task_timing_select(
+                ledger, flow,
+            )))
+        }
+        PromptKind::StartTaskCustomStart { flow } => {
+            let timestamp =
+                parse_time_input_on_day(&prompt.input, flow.selected_day, "start time")?;
+            validate_start_timestamp(timestamp, Utc::now())?;
+            start_task_at(ledger, ledger_path, &flow.task_id, timestamp, flow.note)
+                .map(PromptOutcome::Done)
+        }
+        PromptKind::StartTaskCustomIntervalStart { flow } => {
+            let timestamp =
+                parse_time_input_on_day(&prompt.input, flow.selected_day, "start time")?;
+            validate_start_timestamp(timestamp, Utc::now())?;
+            Ok(PromptOutcome::NextPrompt(PromptState::new(
+                format!(
+                    "End time on {} (HHMM or HH:MM)",
+                    flow.selected_day.format("%Y-%m-%d")
+                ),
+                PromptKind::StartTaskCustomIntervalEnd {
+                    flow,
+                    start_timestamp: timestamp,
+                },
+            )))
+        }
+        PromptKind::StartTaskCustomIntervalEnd {
+            flow,
+            start_timestamp,
+        } => {
+            let end_timestamp =
+                parse_time_input_on_day(&prompt.input, flow.selected_day, "end time")?;
+            validate_interval_bounds(start_timestamp, end_timestamp, Utc::now())?;
+            log_task_interval(
+                ledger,
+                ledger_path,
+                &flow.task_id,
+                start_timestamp,
+                end_timestamp,
+                flow.note,
+            )
+            .map(PromptOutcome::Done)
         }
         PromptKind::EditStartNote {
             event_index,
@@ -1761,11 +1906,52 @@ fn submit_select(
                 category_id: selected_value,
             },
         ))),
+        SelectKind::StartTaskTiming { flow } => {
+            let action =
+                selected_value.ok_or_else(|| "selected start action is missing".to_string())?;
+            match action.as_str() {
+                "now" => start_task(ledger, ledger_path.as_path(), &flow.task_id, flow.note)
+                    .map(SelectOutcome::Done),
+                "start_time" => Ok(SelectOutcome::NextPrompt(PromptState::new(
+                    format!(
+                        "Start time on {} (HHMM or HH:MM)",
+                        flow.selected_day.format("%Y-%m-%d")
+                    ),
+                    PromptKind::StartTaskCustomStart { flow },
+                ))),
+                "start_end_time" => Ok(SelectOutcome::NextPrompt(PromptState::new(
+                    format!(
+                        "Start time on {} (HHMM or HH:MM)",
+                        flow.selected_day.format("%Y-%m-%d")
+                    ),
+                    PromptKind::StartTaskCustomIntervalStart { flow },
+                ))),
+                _ => Err(format!("unknown start action: {action}")),
+            }
+        }
         SelectKind::LedgerSwitch => {
             let selected_path = selected_value
                 .map(PathBuf::from)
                 .ok_or_else(|| "selected ledger path is missing".to_string())?;
             switch_ledger(ledger, ledger_path, selected_path).map(SelectOutcome::Done)
+        }
+        SelectKind::IntervalTask { mut edit } => {
+            let task_id = selected_value.ok_or_else(|| "selected task is missing".to_string())?;
+            if let Some(field) = edit
+                .fields
+                .iter_mut()
+                .find(|field| field.id == EditFieldId::Task)
+            {
+                if let EditFieldKind::Choice { value, .. } = &mut field.kind {
+                    *value = Some(task_id.clone());
+                }
+            }
+            let label = ledger
+                .task(&task_id)
+                .map(|task| task.short_description())
+                .unwrap_or_else(|| "Unknown task".to_string());
+            edit.title = format!("Edit interval: {label}");
+            Ok(SelectOutcome::NextEdit(edit))
         }
         SelectKind::DeleteIntervalConfirm {
             start_event_index,
@@ -1788,7 +1974,10 @@ fn submit_select(
                 Ok(SelectOutcome::Done("Delete cancelled".to_string()))
             }
         }
-        SelectKind::DeleteTaskConfirm { task_id, task_title } => {
+        SelectKind::DeleteTaskConfirm {
+            task_id,
+            task_title,
+        } => {
             let action = selected_value
                 .as_deref()
                 .ok_or_else(|| "selected action is missing".to_string())?;
@@ -1903,6 +2092,70 @@ fn submit_edit(
             let label = description.lines().next().unwrap_or("(no description)");
             Ok(format!("updated task: {label}"))
         }
+        EditEntity::Interval {
+            start_event_index,
+            stop_event_index,
+        } => {
+            let selected_task_id = edit_field_choice_value(edit, EditFieldId::Task)?
+                .ok_or_else(|| "task is required".to_string())?;
+            let note_value = edit_field_text_value(edit, EditFieldId::Description)?;
+            let note = optional_text(&note_value);
+
+            let mut updated_interval = false;
+            let mut updated_note = false;
+            let Some(start_event) = ledger.events.get_mut(*start_event_index) else {
+                return Err("interval start event no longer exists".to_string());
+            };
+            match &mut start_event.kind {
+                EventKind::Start {
+                    task_id,
+                    note: current_note,
+                } => {
+                    if task_id != &selected_task_id {
+                        *task_id = selected_task_id.clone();
+                        updated_interval = true;
+                    }
+                    if *current_note != note {
+                        *current_note = note;
+                        updated_note = true;
+                    }
+                }
+                _ => return Err("interval start event mismatch".to_string()),
+            }
+
+            if let Some(stop_event_index) = stop_event_index {
+                let Some(stop_event) = ledger.events.get_mut(*stop_event_index) else {
+                    return Err("interval stop event no longer exists".to_string());
+                };
+                match &mut stop_event.kind {
+                    EventKind::Stop { task_id, .. } => {
+                        if task_id != &selected_task_id {
+                            *task_id = selected_task_id.clone();
+                            updated_interval = true;
+                        }
+                    }
+                    _ => return Err("interval stop event mismatch".to_string()),
+                }
+            }
+
+            if updated_interval || updated_note {
+                persist(ledger_path, ledger)?;
+            }
+
+            let label = ledger
+                .task(&selected_task_id)
+                .map(|task| task.short_description())
+                .unwrap_or_else(|| "Unknown task".to_string());
+            if updated_interval && updated_note {
+                Ok(format!("updated interval task + note: {label}"))
+            } else if updated_interval {
+                Ok(format!("updated interval task: {label}"))
+            } else if updated_note {
+                Ok(format!("updated interval note: {label}"))
+            } else {
+                Ok("no changes to interval".to_string())
+            }
+        }
     }
 }
 
@@ -1924,6 +2177,28 @@ fn build_project_color_select(name: String) -> SelectState {
         "Select project color",
         SelectKind::ProjectColor { name },
         options,
+    )
+}
+
+fn build_start_task_timing_select(ledger: &Ledger, flow: StartTaskFlow) -> SelectState {
+    let task_title = task_label(ledger, &flow.task_id);
+    let task_style = task_style_for_id(ledger, &flow.task_id);
+    SelectState::new(
+        format!(
+            "Start: {} [{}]",
+            task_title,
+            flow.selected_day.format("%Y-%m-%d")
+        ),
+        SelectKind::StartTaskTiming { flow },
+        vec![
+            SelectOption::new("Start now", Some("now".to_string()), task_style),
+            SelectOption::new("Set start time", Some("start_time".to_string()), task_style),
+            SelectOption::new(
+                "Set start and end time",
+                Some("start_end_time".to_string()),
+                task_style,
+            ),
+        ],
     )
 }
 
@@ -2255,6 +2530,95 @@ fn build_task_edit_state(ledger: &Ledger, task_id: &str) -> Result<EditState, St
     ))
 }
 
+fn build_interval_edit_state(
+    ledger: &Ledger,
+    row: &DaySessionRow,
+    start_event_index: usize,
+) -> Result<EditState, String> {
+    let task = ledger
+        .task(&row.task_id)
+        .ok_or_else(|| format!("task not found: {}", row.task_id))?;
+    let project_options = build_project_options(ledger);
+    if project_options.is_empty() {
+        return Err("no projects available to assign".to_string());
+    }
+    let task_options = build_task_options_for_project(ledger, &task.project_id);
+    if task_options.is_empty() {
+        return Err("no tasks available to assign".to_string());
+    }
+    let note_value = match ledger
+        .events
+        .get(start_event_index)
+        .map(|event| &event.kind)
+    {
+        Some(EventKind::Start { note, .. }) => note.clone().unwrap_or_default(),
+        _ => return Err("interval start event mismatch".to_string()),
+    };
+
+    let fields = vec![
+        EditField::choice(
+            EditFieldId::Project,
+            "Project",
+            Some(task.project_id.clone()),
+            project_options,
+        ),
+        EditField::choice(
+            EditFieldId::Task,
+            "Task",
+            Some(task.id.clone()),
+            task_options,
+        ),
+        EditField::text(
+            EditFieldId::Description,
+            "Session note",
+            note_value,
+            true,
+            true,
+        ),
+    ];
+    let title = format!("Edit interval: {}", task.short_description());
+    Ok(EditState::new(
+        title,
+        EditEntity::Interval {
+            start_event_index,
+            stop_event_index: row.stop_event_index,
+        },
+        fields,
+    ))
+}
+
+fn build_interval_task_select(ledger: &Ledger, edit: &EditState) -> Result<SelectState, String> {
+    let EditEntity::Interval { .. } = edit.entity else {
+        return Err("interval edit state required".to_string());
+    };
+    let project_id = edit_field_choice_value(edit, EditFieldId::Project)?
+        .ok_or_else(|| "project is required".to_string())?;
+    let project_name = ledger
+        .project(&project_id)
+        .map(|project| project.name.clone())
+        .unwrap_or_else(|| "Unknown project".to_string());
+    let options = build_task_select_options_for_project(ledger, &project_id);
+    if options.is_empty() {
+        return Err("no tasks in selected project".to_string());
+    }
+
+    let mut select = SelectState::new(
+        format!("Select task: {project_name}"),
+        SelectKind::IntervalTask { edit: edit.clone() },
+        options,
+    );
+    if let Ok(Some(task_id)) = edit_field_choice_value(edit, EditFieldId::Task) {
+        if let Some(index) = select
+            .options
+            .iter()
+            .position(|option| option.value.as_deref() == Some(task_id.as_str()))
+        {
+            select.selected = index;
+        }
+    }
+    Ok(select)
+}
+
 fn build_project_options(ledger: &Ledger) -> Vec<EditOption> {
     let mut projects = ledger.header.projects.iter().collect::<Vec<_>>();
     projects.sort_by(|left, right| {
@@ -2271,6 +2635,65 @@ fn build_project_options(ledger: &Ledger) -> Vec<EditOption> {
                 project.name.clone()
             };
             EditOption::new(label, Some(project.id.clone()))
+        })
+        .collect()
+}
+
+fn build_task_options_for_project(ledger: &Ledger, project_id: &str) -> Vec<EditOption> {
+    let mut tasks = ledger
+        .header
+        .tasks
+        .iter()
+        .filter(|task| task.project_id == project_id)
+        .collect::<Vec<_>>();
+    tasks.sort_by(|left, right| {
+        left.short_description()
+            .to_lowercase()
+            .cmp(&right.short_description().to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    tasks
+        .into_iter()
+        .map(|task| {
+            let label = if task.archived {
+                format!("{} [archived]", task.short_description())
+            } else {
+                task.short_description()
+            };
+            EditOption::new(label, Some(task.id.clone()))
+        })
+        .collect()
+}
+
+fn build_task_select_options_for_project(ledger: &Ledger, project_id: &str) -> Vec<SelectOption> {
+    let mut tasks = ledger
+        .header
+        .tasks
+        .iter()
+        .filter(|task| task.project_id == project_id)
+        .collect::<Vec<_>>();
+    tasks.sort_by(|left, right| {
+        left.short_description()
+            .to_lowercase()
+            .cmp(&right.short_description().to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let project_style = style_from_project_color(
+        ledger
+            .project(project_id)
+            .and_then(|project| project.color.as_deref()),
+    );
+    tasks
+        .into_iter()
+        .map(|task| {
+            let label = if task.archived {
+                format!("{} [archived]", task.short_description())
+            } else {
+                task.short_description()
+            };
+            SelectOption::new(label, Some(task.id.clone()), project_style)
         })
         .collect()
 }
@@ -2822,8 +3245,18 @@ fn start_task(
     task_id: &str,
     note: Option<String>,
 ) -> Result<String, String> {
+    start_task_at(ledger, ledger_path, task_id, Utc::now(), note)
+}
+
+fn start_task_at(
+    ledger: &mut Ledger,
+    ledger_path: &Path,
+    task_id: &str,
+    timestamp: DateTime<Utc>,
+    note: Option<String>,
+) -> Result<String, String> {
     let task = task_label(ledger, task_id);
-    ledger.start_task(task_id, Utc::now(), note)?;
+    ledger.start_task(task_id, timestamp, note)?;
     persist(ledger_path, ledger)?;
     Ok(format!("started: {task}"))
 }
@@ -2838,6 +3271,23 @@ fn stop_task(
     ledger.stop_task(task_id, Utc::now(), note)?;
     persist(ledger_path, ledger)?;
     Ok(format!("stopped: {task}"))
+}
+
+fn log_task_interval(
+    ledger: &mut Ledger,
+    ledger_path: &Path,
+    task_id: &str,
+    start_timestamp: DateTime<Utc>,
+    end_timestamp: DateTime<Utc>,
+    note: Option<String>,
+) -> Result<String, String> {
+    let task = task_label(ledger, task_id);
+    let mut updated = ledger.clone();
+    updated.start_task(task_id, start_timestamp, note)?;
+    updated.stop_task(task_id, end_timestamp, None)?;
+    persist(ledger_path, &updated)?;
+    *ledger = updated;
+    Ok(format!("logged: {task}"))
 }
 
 fn delete_interval(
@@ -2955,6 +3405,49 @@ fn optional_text(input: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+fn parse_time_input_on_day(
+    input: &str,
+    day: NaiveDate,
+    field_name: &str,
+) -> Result<DateTime<Utc>, String> {
+    let value = required_text(input, field_name)?;
+    let compact = value.replace(':', "");
+    if compact.len() != 4 || !compact.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!(
+            "invalid {field_name} '{value}', expected HHMM or HH:MM"
+        ));
+    }
+
+    let hour = compact[0..2]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid {field_name} '{value}', expected HHMM or HH:MM"))?;
+    let minute = compact[2..4]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid {field_name} '{value}', expected HHMM or HH:MM"))?;
+    local_clock_on_date_to_utc(day, hour, minute)
+}
+
+fn validate_start_timestamp(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> Result<(), String> {
+    if timestamp > now {
+        return Err("start cannot be later than current time".to_string());
+    }
+    Ok(())
+}
+
+fn validate_interval_bounds(
+    start_timestamp: DateTime<Utc>,
+    end_timestamp: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    if end_timestamp <= start_timestamp {
+        return Err("end must be after start".to_string());
+    }
+    if end_timestamp > now {
+        return Err("end cannot be later than current time".to_string());
+    }
+    Ok(())
 }
 
 fn insert_char_at_cursor(input: &mut String, cursor: &mut usize, value: char) {
@@ -3261,6 +3754,55 @@ fn cycle_edit_field(edit: &mut EditState, delta: i32) {
     }
 }
 
+fn refresh_interval_task_options(edit: &mut EditState, ledger: &Ledger) {
+    let EditEntity::Interval { .. } = edit.entity else {
+        return;
+    };
+    let Ok(Some(project_id)) = edit_field_choice_value(edit, EditFieldId::Project) else {
+        return;
+    };
+    let task_options = build_task_options_for_project(ledger, &project_id);
+    let current_task = edit_field_choice_value(edit, EditFieldId::Task)
+        .ok()
+        .flatten();
+
+    let Some(field) = edit
+        .fields
+        .iter_mut()
+        .find(|field| field.id == EditFieldId::Task)
+    else {
+        return;
+    };
+    let EditFieldKind::Choice { value, options } = &mut field.kind else {
+        return;
+    };
+
+    *options = task_options;
+    if options.is_empty() {
+        *value = None;
+        edit.title = "Edit interval: (no task)".to_string();
+        return;
+    }
+
+    if let Some(current_task) = current_task {
+        if options
+            .iter()
+            .any(|option| option.value.as_deref() == Some(current_task.as_str()))
+        {
+            *value = Some(current_task);
+            if let Some(selected_task) = value.as_ref() {
+                edit.title = format!("Edit interval: {}", task_label(ledger, selected_task));
+            }
+            return;
+        }
+    }
+
+    *value = options.first().and_then(|option| option.value.clone());
+    if let Some(selected_task) = value.as_ref() {
+        edit.title = format!("Edit interval: {}", task_label(ledger, selected_task));
+    }
+}
+
 fn commit_edit_field_input(edit: &mut EditState) {
     let Some(field) = edit.fields.get_mut(edit.selected) else {
         return;
@@ -3474,6 +4016,7 @@ enum PromptOutcome {
 enum SelectOutcome {
     NextPrompt(PromptState),
     NextSelect(SelectState),
+    NextEdit(EditState),
     Done(String),
 }
 
@@ -3553,6 +4096,7 @@ impl SelectOption {
 enum EditFieldId {
     Name,
     Description,
+    Task,
     Color,
     Project,
     Category,
@@ -3640,9 +4184,19 @@ impl EditField {
 
 #[derive(Debug, Clone)]
 enum EditEntity {
-    Project { id: String },
-    Category { id: String },
-    Task { id: String },
+    Project {
+        id: String,
+    },
+    Category {
+        id: String,
+    },
+    Task {
+        id: String,
+    },
+    Interval {
+        start_event_index: usize,
+        stop_event_index: Option<usize>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -3695,7 +4249,17 @@ enum PromptKind {
         category_id: Option<String>,
     },
     StartTaskNote {
-        task_id: String,
+        flow: StartTaskFlow,
+    },
+    StartTaskCustomStart {
+        flow: StartTaskFlow,
+    },
+    StartTaskCustomIntervalStart {
+        flow: StartTaskFlow,
+    },
+    StartTaskCustomIntervalEnd {
+        flow: StartTaskFlow,
+        start_timestamp: DateTime<Utc>,
     },
     EditStartNote {
         event_index: usize,
@@ -3712,7 +4276,13 @@ enum SelectKind {
     TaskCategory {
         project_id: String,
     },
+    StartTaskTiming {
+        flow: StartTaskFlow,
+    },
     LedgerSwitch,
+    IntervalTask {
+        edit: EditState,
+    },
     DeleteIntervalConfirm {
         start_event_index: usize,
         stop_event_index: Option<usize>,
@@ -4108,6 +4678,23 @@ struct TaskEventRef {
 struct LineRange {
     start: usize,
     end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct StartTaskFlow {
+    task_id: String,
+    selected_day: NaiveDate,
+    note: Option<String>,
+}
+
+impl StartTaskFlow {
+    fn new(task_id: String, selected_day: NaiveDate, note: Option<String>) -> Self {
+        Self {
+            task_id,
+            selected_day,
+            note,
+        }
+    }
 }
 
 pub fn print_event_log(ledger: &Ledger, limit: usize) {
