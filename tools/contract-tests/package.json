@@ -3,6 +3,10 @@
 	"version": "0.1.0",
 	"private": true,
 	"scripts": {
-		"validate": "node -e \"console.log('contract validation tooling not installed yet')\""
+		"validate": "node ./src/validate-fixtures.mjs"
+	},
+	"devDependencies": {
+		"@iarna/toml": "^2.2.5",
+		"ajv": "^8.18.0"
 	}
 }

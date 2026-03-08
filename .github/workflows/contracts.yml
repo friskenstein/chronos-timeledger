@@ -1,0 +1,29 @@
+name: Contracts
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.19.0
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm --dir tools/contract-tests run validate
+
+      - run: pnpm --dir apps/mobile run test
+
+      - run: cargo test --manifest-path apps/tui/Cargo.toml

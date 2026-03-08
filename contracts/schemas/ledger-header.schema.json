@@ -55,7 +55,6 @@
 			"required": [
 				"id",
 				"name",
-				"color",
 				"archived"
 			],
 			"properties": {
@@ -83,7 +82,6 @@
 			"required": [
 				"id",
 				"project_id",
-				"category_id",
 				"description",
 				"archived"
 			],
@@ -116,7 +114,6 @@
 			"required": [
 				"id",
 				"name",
-				"description",
 				"archived"
 			],
 			"properties": {

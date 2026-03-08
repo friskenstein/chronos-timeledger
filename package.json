@@ -6,8 +6,12 @@
 		"tools/*"
 	],
 	"scripts": {
+		"contracts:validate": "pnpm --dir tools/contract-tests run validate",
+		"mobile:test": "pnpm --dir apps/mobile run test",
 		"mobile:start": "npm --workspace apps/mobile run start",
 		"mobile:typecheck": "npm --workspace apps/mobile run typecheck",
-		"tui:check": "cargo check --manifest-path apps/tui/Cargo.toml"
+		"tui:check": "cargo check --manifest-path apps/tui/Cargo.toml",
+		"tui:test": "cargo test --manifest-path apps/tui/Cargo.toml",
+		"ci:contract": "pnpm run contracts:validate && pnpm run mobile:test && pnpm run tui:test"
 	}
 }

@@ -123,9 +123,45 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[test]
+    fn loads_shared_roundtrip_fixture() {
+        let path = shared_fixture("roundtrip/example.ledger");
+        let ledger = load_ledger(&path).expect("fixture should load");
+
+        assert_eq!(ledger.header.schema_version, 1);
+        assert_eq!(ledger.header.projects.len(), 2);
+        assert_eq!(ledger.header.tasks.len(), 2);
+        assert_eq!(ledger.header.categories.len(), 1);
+        assert_eq!(ledger.events.len(), 4);
+    }
+
+    #[test]
+    fn shared_roundtrip_fixture_is_canonical_for_rust_storage() {
+        let fixture_path = shared_fixture("roundtrip/example.ledger");
+        let fixture_raw = fs::read_to_string(&fixture_path).expect("fixture should be readable");
+        let ledger = load_ledger(&fixture_path).expect("fixture should load");
+
+        let path = temp_file("chronos_shared_contract_roundtrip.ledger");
+        save_ledger(&path, &ledger).expect("save should succeed");
+
+        let saved_raw = fs::read_to_string(&path).expect("saved fixture should be readable");
+        assert_eq!(saved_raw, fixture_raw);
+
+        let reloaded = load_ledger(&path).expect("saved fixture should load");
+        assert_eq!(reloaded.header.tasks.len(), ledger.header.tasks.len());
+        assert_eq!(reloaded.events.len(), ledger.events.len());
+        let _ = fs::remove_file(path);
+    }
+
     fn temp_file(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!("{}_{}", name, std::process::id()));
         path
+    }
+
+    fn shared_fixture(relative_path: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/fixtures")
+            .join(relative_path)
     }
 }

@@ -1,7 +1,15 @@
 # Contract Tests
 
-Reserved for schema and fixture validation tooling.
+Validation scripts for the shared Chronos datastore contract live here.
 
-The current monorepo layout includes the shared contract assets under
-`contracts/`. A validation CLI can be added here once package dependencies are
-installed for the workspace.
+Current responsibilities:
+
+- validate shared header and event fixtures against the JSON schemas
+- validate full `.ledger` fixtures by parsing TOML + JSONL sections
+- assert that intentionally invalid fixtures are rejected
+
+Run:
+
+```bash
+pnpm --dir tools/contract-tests run validate
+```
